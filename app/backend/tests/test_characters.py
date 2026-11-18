@@ -23,22 +23,20 @@ class TestCharacters:
         assert data["project_id"] == test_project.id
 
     @pytest.mark.asyncio
-    async def test_create_max_characters(self, client: AsyncClient, auth_headers, test_project):
-        # Create 6 characters (max allowed)
-        for i in range(6):
+    async def test_create_more_than_six_characters(self, client: AsyncClient, auth_headers, test_project):
+        # Create 7 characters (no limit enforced)
+        for i in range(7):
             response = await client.post(f"/api/v1/projects/{test_project.id}/characters", json={
                 "name": f"Character {i+1}",
                 "role": "supporting"
             }, headers=auth_headers)
             assert response.status_code == 201
         
-        # 7th character should fail
-        response = await client.post(f"/api/v1/projects/{test_project.id}/characters", json={
-            "name": "Character 7",
-            "role": "supporting"
-        }, headers=auth_headers)
-        assert response.status_code == 400
-        assert "Maximum of 6 characters" in response.json()["detail"]
+        # All 7 should succeed
+        response = await client.get(f"/api/v1/projects/{test_project.id}/characters", headers=auth_headers)
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 7
 
     @pytest.mark.asyncio
     async def test_list_characters(self, client: AsyncClient, auth_headers, test_project):
@@ -110,3 +108,36 @@ class TestCharacters:
         # User 2 should not see it in list
         response = await client.get(f"/api/v1/projects/{test_project.id}/characters", headers=auth_headers2)
         assert response.status_code == 404
+
+class TestCharacterNewFields:
+    """Audit F-03: voice_pattern / physical_traits / skills must exist."""
+
+    @pytest.mark.asyncio
+    async def test_create_character_with_voice_and_physical_traits(
+        self, client: AsyncClient, auth_headers, test_project
+    ):
+        response = await client.post(f"/api/v1/projects/{test_project.id}/characters", json={
+            "name": "Nadia", "role": "protagonist",
+            "voice_pattern": "Soft, measured, warm",
+            "physical_traits": "Tall, graceful, dark hair",
+            "skills": ["martial arts", "negotiation"],
+        }, headers=auth_headers)
+        assert response.status_code == 201, response.text
+        data = response.json()
+        assert data["voice_pattern"] == "Soft, measured, warm"
+        assert data["physical_traits"] == "Tall, graceful, dark hair"
+
+        # Round-trip via GET
+        get_response = await client.get(
+            f"/api/v1/projects/{test_project.id}/characters/{data['id']}",
+            headers=auth_headers)
+        assert get_response.json()["voice_pattern"] == "Soft, measured, warm"
+
+        # PATCH the new fields
+        patch = await client.patch(
+            f"/api/v1/projects/{test_project.id}/characters/{data['id']}", json={
+                "voice_pattern": "Cold, clipped, confident",
+                "skills": ["driving"],
+            }, headers=auth_headers)
+        assert patch.status_code == 200, patch.text
+        assert patch.json()["voice_pattern"] == "Cold, clipped, confident"

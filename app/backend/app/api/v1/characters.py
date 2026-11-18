@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, or_
+from sqlalchemy import select
 from typing import List, Optional
 
 from app.core.database import get_db
@@ -36,18 +36,7 @@ async def create_character(
     db: AsyncSession = Depends(get_db)
 ):
     project = await get_project_or_404(project_id, current_user.id, db)
-    
-    # Check character count (max 6 per project as per requirements)
-    count_result = await db.execute(
-        select(func.count(Character.id)).where(Character.project_id == project_id)
-    )
-    count = count_result.scalar()
-    if count >= 6:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Maximum of 6 characters allowed per project"
-        )
-    
+
     character = Character(
         project_id=project_id,
         name=character_data.name,
@@ -68,6 +57,9 @@ async def create_character(
         motivations=character_data.motivations,
         fears=character_data.fears,
         quirks=character_data.quirks,
+        voice_pattern=character_data.voice_pattern,
+        physical_traits=character_data.physical_traits,
+        skills=str(character_data.skills) if character_data.skills else None,
         costume_style=character_data.costume_style,
         signature_items=str(character_data.signature_items) if character_data.signature_items else None,
         color_palette=str(character_data.color_palette) if character_data.color_palette else None,
@@ -188,6 +180,9 @@ async def update_character(
         "motivations": character.motivations,
         "fears": character.fears,
         "quirks": character.quirks,
+        "voice_pattern": character.voice_pattern,
+        "physical_traits": character.physical_traits,
+        "skills": character.skills,
         "costume_style": character.costume_style,
         "signature_items": character.signature_items,
         "color_palette": character.color_palette,
@@ -197,7 +192,7 @@ async def update_character(
     
     update_data = character_data.model_dump(exclude_unset=True)
     for field, value in update_data.items():
-        if field in ["personality_traits", "signature_items", "color_palette", "reference_images"] and value is not None:
+        if field in ["personality_traits", "signature_items", "color_palette", "reference_images", "skills"] and value is not None:
             value = str(value)
         setattr(character, field, value)
     
@@ -223,6 +218,9 @@ async def update_character(
         "motivations": character.motivations,
         "fears": character.fears,
         "quirks": character.quirks,
+        "voice_pattern": character.voice_pattern,
+        "physical_traits": character.physical_traits,
+        "skills": character.skills,
         "costume_style": character.costume_style,
         "signature_items": character.signature_items,
         "color_palette": character.color_palette,

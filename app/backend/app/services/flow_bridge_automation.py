@@ -5,7 +5,7 @@ Uses Playwright for browser automation of Google accounts and AI image generatio
 import asyncio
 import json
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 from enum import Enum
 from dataclasses import dataclass, field
@@ -59,8 +59,8 @@ class AutomationTask:
     error_message: Optional[str] = None
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
-    created_at: datetime = field(default_factory=datetime.utcnow)
-    updated_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class BrowserAutomationService:
@@ -359,8 +359,8 @@ class BrowserAutomationService:
             await self.initialize()
         
         task.status = AutomationStatus.RUNNING
-        task.started_at = datetime.utcnow()
-        task.updated_at = datetime.utcnow()
+        task.started_at = datetime.now(timezone.utc)
+        task.updated_at = datetime.now(timezone.utc)
         
         if self.mock_mode:
             # Mock execution - simulate successful completion
@@ -368,7 +368,7 @@ class BrowserAutomationService:
             
             for i, step in enumerate(task.steps):
                 task.current_step = i
-                task.updated_at = datetime.utcnow()
+                task.updated_at = datetime.now(timezone.utc)
                 logger.info(f"Executing step {i+1}/{len(task.steps)} (MOCK): {step.description}")
                 
                 # Mock step results based on task type
@@ -389,10 +389,10 @@ class BrowserAutomationService:
                         step.result = "mock_session_cookies=refreshed_abc123; session_id=refreshed_xyz789"
                 
                 step.completed = True
-                task.updated_at = datetime.utcnow()
+                task.updated_at = datetime.now(timezone.utc)
             
             task.status = AutomationStatus.COMPLETED
-            task.completed_at = datetime.utcnow()
+            task.completed_at = datetime.now(timezone.utc)
             
             # Collect results
             if task.task_type == AutomationTaskType.LOGIN_GOOGLE:
@@ -418,17 +418,17 @@ class BrowserAutomationService:
             try:
                 for i, step in enumerate(task.steps):
                     task.current_step = i
-                    task.updated_at = datetime.utcnow()
+                    task.updated_at = datetime.now(timezone.utc)
                     
                     logger.info(f"Executing step {i+1}/{len(task.steps)}: {step.description}")
                     
                     result = await self._execute_step(page, step)
                     step.result = result
                     step.completed = True
-                    task.updated_at = datetime.utcnow()
+                    task.updated_at = datetime.now(timezone.utc)
                 
                 task.status = AutomationStatus.COMPLETED
-                task.completed_at = datetime.utcnow()
+                task.completed_at = datetime.now(timezone.utc)
                 
                 # Collect results
                 if task.task_type == AutomationTaskType.LOGIN_GOOGLE:
@@ -448,10 +448,10 @@ class BrowserAutomationService:
                 logger.error(f"Task {task_id} failed: {e}")
                 task.status = AutomationStatus.FAILED
                 task.error_message = str(e)
-                task.completed_at = datetime.utcnow()
+                task.completed_at = datetime.now(timezone.utc)
             finally:
                 await page.close()
-                task.updated_at = datetime.utcnow()
+                task.updated_at = datetime.now(timezone.utc)
         
         return task
     
@@ -499,8 +499,14 @@ class BrowserAutomationService:
         return tasks
 
 
-# Global service instance
-automation_service = BrowserAutomationService(mock_mode=True)
+# Global service instance. Real automation is opt-in via env
+# (FLOW_AUTOMATION_ENABLED=1) and requires Playwright; the default is
+# mock mode, and the API layer refuses mutating calls while mock mode is
+# on (audit F-02) — mock results can never overwrite real session data.
+import os as _os
+automation_service = BrowserAutomationService(
+    mock_mode=_os.getenv("FLOW_AUTOMATION_ENABLED") != "1"
+)
 
 
 async def get_automation_service() -> BrowserAutomationService:

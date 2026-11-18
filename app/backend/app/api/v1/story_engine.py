@@ -1,10 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select
 from typing import List, Optional, Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
 import json
-import uuid
 
 from app.core.database import get_db
 from app.api.v1.auth import get_current_user, create_audit_log
@@ -13,7 +12,7 @@ from app.models.project import Project
 from app.models.series_bible import SeriesBible
 from app.models.character import Character
 from app.models.location import Location
-from app.models.episode import Episode
+from app.models.episode import Episode, EpisodeStatus
 from app.models.story_engine import StoryEngineTask, StoryEngineTaskStatus, StoryEngineTaskType
 from app.models.audit_log import AuditAction
 from app.schemas.story_engine import (
@@ -21,6 +20,7 @@ from app.schemas.story_engine import (
     StoryOutlineResponse, CharacterArcResponse, WorldBuildingResponse,
     RefineStoryRequest, RefineStoryResponse
 )
+from app.services.ai_client import get_ai_client, AIClientError
 
 router = APIRouter()
 
@@ -67,105 +67,342 @@ def task_to_response(task: StoryEngineTask) -> StoryEngineResponse:
     )
 
 
-async def generate_story_outline(db: AsyncSession, project_id: str, series_bible: SeriesBible, parameters: Dict[str, Any] = None) -> Dict[str, Any]:
-    """Mock AI story generation - replace with actual LLM call."""
+def build_story_outline_prompt(series_bible: SeriesBible, characters: List[Character], total_episodes: int, user_context: Optional[str] = None) -> str:
+    """Build prompt for story outline generation."""
+    # All characters are included (audit F-17/P1-07): previously only the
+    # first 5 were used, silently dropping character 6+. Each entry is kept
+    # short so long casts still fit the prompt.
+    char_info = "\n".join([
+        f"- {c.name} ({c.role}): {c.background[:200] if c.background else 'No background'}"
+        for c in characters
+    ]) if characters else "No characters defined yet."
+
+    context_block = ""
+    if user_context:
+        context_block = f"\nUSER INSTRUCTIONS (follow these first):\n{user_context}\n"
+
+    return f"""You are a professional TV series writer. Create a detailed episode-by-episode outline for a {total_episodes}-episode micro-drama series.
+
+SERIES BIBLE:
+- Premise: {series_bible.premise or 'Not specified'}
+- Main Plot: {series_bible.main_plot or 'Not specified'}
+- Subplots: {series_bible.subplots or 'Not specified'}
+- Tone & Visual Style: {series_bible.tone_and_visual_style or 'Not specified'}
+- Ending Direction: {series_bible.ending_direction or 'Not specified'}
+{context_block}
+CHARACTERS:
+{char_info}
+
+Generate a JSON response with this exact structure:
+{{
+  "series_bible_id": "{series_bible.id}",
+  "total_episodes": {total_episodes},
+  "episodes": [
+    {{
+      "episode_number": 1,
+      "title": "Episode title",
+      "logline": "One-sentence hook",
+      "synopsis": "2-3 paragraph summary",
+      "key_beats": ["beat 1", "beat 2", "beat 3", "beat 4", "beat 5"],
+      "character_focus": ["Character A", "Character B"]
+    }}
+  ],
+  "generated_at": "ISO timestamp"
+}}
+
+Each episode should have 5 key beats following dramatic structure: Setup, Inciting Incident, Rising Action, Climax, Resolution.
+Character focus should list 2-3 main characters per episode.
+Return ONLY valid JSON, no markdown formatting."""
+
+
+def build_character_arcs_prompt(series_bible: SeriesBible, characters: List[Character]) -> str:
+    """Build prompt for character arcs generation."""
+    char_info = "\n".join([
+        f"- {c.name} ({c.role}): Age {c.age or '?'}, {c.gender or '?'}, {c.ethnicity or '?'}. "
+        f"Background: {c.background[:300] if c.background else 'Not specified'}. "
+        f"Motivations: {c.motivations[:200] if c.motivations else 'Not specified'}. "
+        f"Fears: {c.fears[:200] if c.fears else 'Not specified'}. "
+        f"Personality: {c.personality_traits[:200] if c.personality_traits else 'Not specified'}."
+        for c in characters
+    ]) if characters else "No characters defined yet."
+
+    return f"""You are a professional TV series writer. Create detailed character arcs for each character in this micro-drama series.
+
+SERIES BIBLE:
+- Premise: {series_bible.premise or 'Not specified'}
+- Main Plot: {series_bible.main_plot or 'Not specified'}
+- Tone: {series_bible.tone_and_visual_style or 'Not specified'}
+
+CHARACTERS:
+{char_info}
+
+Generate a JSON response with this exact structure:
+{{
+  "arcs": [
+    {{
+      "character_id": "uuid",
+      "character_name": "Name",
+      "arc_summary": "Overall transformation summary",
+      "key_moments": [
+        {{"episode": 1, "moment": "Description"}},
+        {{"episode": 5, "moment": "Description"}},
+        {{"episode": 10, "moment": "Description"}},
+        {{"episode": 15, "moment": "Description"}},
+        {{"episode": 20, "moment": "Description"}}
+      ],
+      "emotional_journey": "Stage1 -> Stage2 -> Stage3 -> Stage4 -> Stage5"
+    }}
+  ]
+}}
+
+Each character should have 5 key moments across the series (episodes 1, 5, 10, 15, 20).
+Emotional journey should show 5 emotional stages.
+Return ONLY valid JSON, no markdown formatting."""
+
+
+def build_world_building_prompt(series_bible: SeriesBible, locations: List[Location], characters: List[Character]) -> str:
+    """Build prompt for world building generation."""
+    loc_info = "\n".join([
+        f"- {loc.name} ({loc.type}): {loc.description[:200] if loc.description else 'No description'}"
+        for loc in locations
+    ]) if locations else "No locations defined yet."
+
+    return f"""You are a professional TV series writer. Create comprehensive world building for this micro-drama series.
+
+SERIES BIBLE:
+- Premise: {series_bible.premise or 'Not specified'}
+- Main Plot: {series_bible.main_plot or 'Not specified'}
+- World Settings: {series_bible.world_settings or 'Not specified'}
+
+EXISTING LOCATIONS:
+{loc_info}
+
+Generate a JSON response with this exact structure:
+{{
+  "series_bible_id": "{series_bible.id}",
+  "locations": [
+    {{"name": "Location name", "type": "urban/rural/hidden/etc", "description": "Detailed description"}}
+  ],
+  "factions": [
+    {{"name": "Faction name", "type": "government/rebel/corporate/etc", "description": "Description"}}
+  ],
+  "technology": [
+    {{"name": "Tech name", "description": "Description"}}
+  ],
+  "culture": [
+    {{"name": "Cultural element", "description": "Description"}}
+  ],
+  "history": [
+    {{"event": "Historical event", "year": "Year", "description": "Description"}}
+  ],
+  "generated_at": "ISO timestamp"
+}}
+
+Include at least 3 locations (use existing + add new), 2-3 factions, 2-3 technologies, 2-3 cultural elements, and 2-3 historical events.
+Return ONLY valid JSON, no markdown formatting."""
+
+
+def build_refine_prompt(original_output: Dict[str, Any], feedback: str, refine_type: str) -> str:
+    """Build prompt for story refinement."""
+    return f"""You are a professional TV series writer. Refine the following story content based on user feedback.
+
+ORIGINAL OUTPUT:
+{json.dumps(original_output, indent=2)}
+
+FEEDBACK: {feedback}
+REFINEMENT TYPE: {refine_type}
+
+Generate a JSON response with this exact structure:
+{{
+  "refined_output": {{...}},  // The entire refined output with same structure as original
+  "refinement_notes": "What was changed and why",
+  "refined_at": "ISO timestamp"
+}}
+
+Return ONLY valid JSON, no markdown formatting."""
+
+
+def build_single_episode_prompt(series_bible: SeriesBible, characters: List[Character], episode_number: int, user_context: Optional[str] = None) -> str:
+    """Build prompt for generating one episode (GENERATE_EPISODE)."""
+    char_info = "\n".join([
+        f"- {c.name} ({c.role}): {c.background[:200] if c.background else 'No background'}"
+        for c in characters
+    ]) if characters else "No characters defined yet."
+
+    context_block = ""
+    if user_context:
+        context_block = f"\nUSER INSTRUCTIONS (follow these first):\n{user_context}\n"
+
+    return f"""You are a professional TV series writer. Create a detailed outline for ONE episode (episode {episode_number}) of a micro-drama series.
+
+SERIES BIBLE:
+- Premise: {series_bible.premise or 'Not specified'}
+- Main Plot: {series_bible.main_plot or 'Not specified'}
+- Subplots: {series_bible.subplots or 'Not specified'}
+- Tone & Visual Style: {series_bible.tone_and_visual_style or 'Not specified'}
+- Ending Direction: {series_bible.ending_direction or 'Not specified'}
+{context_block}
+CHARACTERS:
+{char_info}
+
+Generate a JSON response with this exact structure:
+{{
+  "series_bible_id": "{series_bible.id}",
+  "episode_number": {episode_number},
+  "title": "Episode title",
+  "logline": "One-sentence hook",
+  "synopsis": "2-3 paragraph summary",
+  "key_beats": ["beat 1", "beat 2", "beat 3", "beat 4", "beat 5"],
+  "character_focus": ["Character A", "Character B"]
+}}
+
+The episode should have 5 key beats following dramatic structure: Setup, Inciting Incident, Rising Action, Climax, Resolution.
+Character focus should list 2-3 main characters for this episode.
+Return ONLY valid JSON, no markdown formatting."""
+
+
+async def generate_story_outline_llm(db: AsyncSession, project_id: str, series_bible: SeriesBible, parameters: Dict[str, Any] = None, user_context: Optional[str] = None) -> Dict[str, Any]:
+    """Generate story outline using real LLM."""
     total_episodes = parameters.get("total_episodes", 20) if parameters else 20
-    
-    # Get characters for this project
-    result = await db.execute(select(Character).where(Character.project_id == project_id).limit(5))
+
+    result = await db.execute(select(Character).where(Character.project_id == project_id))
     characters = result.scalars().all()
+
+    ai_client = await get_ai_client(db)
+    prompt = build_story_outline_prompt(series_bible, list(characters), total_episodes, user_context)
     
-    episodes = []
-    for i in range(1, total_episodes + 1):
-        episodes.append({
-            "episode_number": i,
-            "title": f"Episode {i}: {series_bible.premise[:30]} - Part {i}" if series_bible.premise else f"Episode {i}",
-            "logline": f"In this episode, the protagonists face a new challenge related to {series_bible.main_plot[:40]}." if series_bible.main_plot else f"Episode {i} continues the story.",
-            "synopsis": f"Episode {i} continues the story of {series_bible.premise}. The main conflict deepens as {series_bible.main_plot}. Key characters develop their arcs." if series_bible.premise else f"Episode {i} synopsis.",
-            "key_beats": [
-                f"Opening: Establish the stakes for episode {i}",
-                f"Inciting incident: New complication arises",
-                f"Rising action: Characters investigate/respond",
-                f"Climax: Major confrontation or revelation",
-                f"Resolution: Temporary resolution, setup for next episode"
+    try:
+        response = await ai_client.chat_completion(
+            messages=[
+                {"role": "system", "content": "You are a professional TV series writer. Output only valid JSON."},
+                {"role": "user", "content": prompt}
             ],
-            "character_focus": [c.name for c in characters[:3]] if characters else ["Protagonist", "Antagonist", "Supporting"]
-        })
-    
-    return {
-        "series_bible_id": str(series_bible.id),
-        "total_episodes": total_episodes,
-        "episodes": episodes,
-        "generated_at": datetime.utcnow().isoformat()
-    }
+            temperature=0.7,
+            max_tokens=8000,
+            response_format={"type": "json_object"}
+        )
+        output = json.loads(response.content)
+        output["generated_at"] = datetime.now(timezone.utc).isoformat()
+        return output
+    except AIClientError as e:
+        raise HTTPException(status_code=502, detail=f"All AI providers failed: {e.errors}")
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=502, detail=f"Invalid JSON from AI: {e}")
 
 
-async def generate_character_arcs(db: AsyncSession, project_id: str, series_bible: SeriesBible, parameters: Dict[str, Any] = None) -> Dict[str, Any]:
-    """Mock AI character arc generation."""
+async def generate_single_episode_llm(db: AsyncSession, project_id: str, series_bible: SeriesBible, parameters: Dict[str, Any] = None, user_context: Optional[str] = None) -> Dict[str, Any]:
+    """Generate a single episode outline using real LLM (GENERATE_EPISODE)."""
+    episode_number = 1
+    if parameters:
+        try:
+            episode_number = int(parameters.get("episode_number", 1))
+        except (TypeError, ValueError):
+            episode_number = 1
+
+    result = await db.execute(select(Character).where(Character.project_id == project_id))
+    characters = result.scalars().all()
+
+    ai_client = await get_ai_client(db)
+    prompt = build_single_episode_prompt(series_bible, list(characters), episode_number, user_context)
+
+    try:
+        response = await ai_client.chat_completion(
+            messages=[
+                {"role": "system", "content": "You are a professional TV series writer. Output only valid JSON."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=8000,
+            response_format={"type": "json_object"}
+        )
+        output = json.loads(response.content)
+        output["generated_at"] = datetime.now(timezone.utc).isoformat()
+        return output
+    except AIClientError as e:
+        raise HTTPException(status_code=502, detail=f"All AI providers failed: {e.errors}")
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=502, detail=f"Invalid JSON from AI: {e}")
+
+
+async def generate_character_arcs_llm(db: AsyncSession, project_id: str, series_bible: SeriesBible, parameters: Dict[str, Any] = None) -> Dict[str, Any]:
+    """Generate character arcs using real LLM."""
     result = await db.execute(select(Character).where(Character.project_id == project_id))
     characters = result.scalars().all()
     
-    arcs = []
-    for char in characters:
-        arcs.append({
-            "character_id": str(char.id),
-            "character_name": char.name,
-            "arc_summary": f"{char.name} undergoes a transformation from {char.role} to a changed person through the series.",
-            "key_moments": [
-                {"episode": 1, "moment": "Introduction and establishment of core wound"},
-                {"episode": 5, "moment": "First major test of character's beliefs"},
-                {"episode": 10, "moment": "Midpoint reversal - character forced to change"},
-                {"episode": 15, "moment": "Dark night of the soul"},
-                {"episode": 20, "moment": "Final transformation and resolution"}
-            ],
-            "emotional_journey": "Fear -> Courage -> Doubt -> Determination -> Mastery",
-            "generated_at": datetime.utcnow().isoformat()
-        })
+    ai_client = await get_ai_client(db)
+    prompt = build_character_arcs_prompt(series_bible, list(characters))
     
-    return {"arcs": arcs}
+    try:
+        response = await ai_client.chat_completion(
+            messages=[
+                {"role": "system", "content": "You are a professional TV series writer. Output only valid JSON."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=8000,
+            response_format={"type": "json_object"}
+        )
+        output = json.loads(response.content)
+        output["generated_at"] = datetime.now(timezone.utc).isoformat()
+        return output
+    except AIClientError as e:
+        raise HTTPException(status_code=502, detail=f"All AI providers failed: {e.errors}")
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=502, detail=f"Invalid JSON from AI: {e}")
 
 
-async def generate_world_building(db: AsyncSession, project_id: str, series_bible: SeriesBible, parameters: Dict[str, Any] = None) -> Dict[str, Any]:
-    """Mock AI world building generation."""
+async def generate_world_building_llm(db: AsyncSession, project_id: str, series_bible: SeriesBible, parameters: Dict[str, Any] = None) -> Dict[str, Any]:
+    """Generate world building using real LLM."""
     result = await db.execute(select(Location).where(Location.project_id == project_id))
     locations = result.scalars().all()
     
-    return {
-        "series_bible_id": str(series_bible.id),
-        "locations": [
-            {"name": loc.name, "type": loc.type, "description": f"Key location: {loc.name}"}
-            for loc in locations
-        ] if locations else [
-            {"name": "Main City", "type": "urban", "description": "Primary setting"},
-            {"name": "Secret Base", "type": "hidden", "description": "Protagonist's hideout"}
-        ],
-        "factions": [
-            {"name": "The Authority", "type": "government", "description": "Ruling power"},
-            {"name": "The Resistance", "type": "rebel", "description": "Opposition group"}
-        ],
-        "technology": [
-            {"name": "Neural Link", "description": "Brain-computer interface"},
-            {"name": "Hover Transport", "description": "Anti-gravity vehicles"}
-        ],
-        "culture": [
-            {"name": "Festival of Lights", "description": "Annual celebration"},
-            {"name": "Code of Silence", "description": "Cultural taboo"}
-        ],
-        "history": [
-            {"event": "The Great Collapse", "year": "20XX", "description": "Societal breakdown"},
-            {"event": "Rise of the Authority", "year": "20XX", "description": "New order established"}
-        ],
-        "generated_at": datetime.utcnow().isoformat()
-    }
+    char_result = await db.execute(select(Character).where(Character.project_id == project_id))
+    characters = char_result.scalars().all()
+    
+    ai_client = await get_ai_client(db)
+    prompt = build_world_building_prompt(series_bible, list(locations), list(characters))
+    
+    try:
+        response = await ai_client.chat_completion(
+            messages=[
+                {"role": "system", "content": "You are a professional TV series writer. Output only valid JSON."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=8000,
+            response_format={"type": "json_object"}
+        )
+        output = json.loads(response.content)
+        output["generated_at"] = datetime.now(timezone.utc).isoformat()
+        return output
+    except AIClientError as e:
+        raise HTTPException(status_code=502, detail=f"All AI providers failed: {e.errors}")
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=502, detail=f"Invalid JSON from AI: {e}")
 
 
-async def refine_story_output(task: StoryEngineTask, feedback: str, refine_type: str) -> Dict[str, Any]:
-    """Mock AI story refinement."""
-    return {
-        "refined_output": task.output,
-        "refinement_notes": f"Applied {refine_type} refinement based on: {feedback}",
-        "refined_at": datetime.utcnow().isoformat()
-    }
+async def refine_story_output_llm(db: AsyncSession, task: StoryEngineTask, feedback: str, refine_type: str) -> Dict[str, Any]:
+    """Refine story output using real LLM."""
+    ai_client = await get_ai_client(db)
+    prompt = build_refine_prompt(task.output or {}, feedback, refine_type)
+    
+    try:
+        response = await ai_client.chat_completion(
+            messages=[
+                {"role": "system", "content": "You are a professional TV series writer. Output only valid JSON."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.5,
+            max_tokens=8000,
+            response_format={"type": "json_object"}
+        )
+        output = json.loads(response.content)
+        output["refined_at"] = datetime.now(timezone.utc).isoformat()
+        return output
+    except AIClientError as e:
+        raise HTTPException(status_code=502, detail=f"All AI providers failed: {e.errors}")
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=502, detail=f"Invalid JSON from AI: {e}")
 
 
 @router.post("/{project_id}/story-engine/tasks", response_model=StoryEngineResponse, status_code=status.HTTP_201_CREATED)
@@ -237,19 +474,21 @@ async def execute_story_task(
     try:
         # Execute based on task type
         if task.task_type == StoryEngineTaskType.GENERATE_OUTLINE:
-            output = await generate_story_outline(db, project_id, series_bible, task.input_parameters)
+            output = await generate_story_outline_llm(db, project_id, series_bible, task.input_parameters, task.context)
+        elif task.task_type == StoryEngineTaskType.GENERATE_EPISODE:
+            output = await generate_single_episode_llm(db, project_id, series_bible, task.input_parameters, task.context)
         elif task.task_type == StoryEngineTaskType.GENERATE_CHARACTER_ARCS:
-            output = await generate_character_arcs(db, project_id, series_bible, task.input_parameters)
+            output = await generate_character_arcs_llm(db, project_id, series_bible, task.input_parameters)
         elif task.task_type == StoryEngineTaskType.GENERATE_WORLD_BUILDING:
-            output = await generate_world_building(db, project_id, series_bible, task.input_parameters)
+            output = await generate_world_building_llm(db, project_id, series_bible, task.input_parameters)
         elif task.task_type == StoryEngineTaskType.REFINE_STORY:
-            output = await refine_story_output(task, task.context or "", "general")
+            output = await refine_story_output_llm(db, task, task.context or "", "general")
         else:
             raise ValueError(f"Unknown task type: {task.task_type}")
         
         task.output = output
         task.status = StoryEngineTaskStatus.COMPLETED
-        task.completed_at = datetime.utcnow()
+        task.completed_at = datetime.now(timezone.utc)
         
         create_audit_log(
             db, current_user.id, AuditAction.STORY_ENGINE_TASK_EXECUTE,
@@ -259,10 +498,29 @@ async def execute_story_task(
             new_values={"status": "completed", "output_keys": list(output.keys()) if output else []}
         )
         
+    except HTTPException as e:
+        # Audit F-08: a failed execute used to re-raise without touching the
+        # row, leaving the task stuck in PROCESSING forever (retry -> 400).
+        # Mark it FAILED first (persisted), then re-raise so the caller
+        # still sees the original error status. FAILED tasks can be retried:
+        # execute only refuses PROCESSING tasks.
+        task.status = StoryEngineTaskStatus.FAILED
+        task.error_message = e.detail if isinstance(e.detail, str) else str(e.detail)
+        task.completed_at = datetime.now(timezone.utc)
+        create_audit_log(
+            db, current_user.id, AuditAction.STORY_ENGINE_TASK_EXECUTE,
+            resource_type="story_engine_task", resource_id=task.id,
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            success=False,
+            error_message=task.error_message
+        )
+        await db.commit()
+        raise
     except Exception as e:
         task.status = StoryEngineTaskStatus.FAILED
         task.error_message = str(e)
-        task.completed_at = datetime.utcnow()
+        task.completed_at = datetime.now(timezone.utc)
         
         create_audit_log(
             db, current_user.id, AuditAction.STORY_ENGINE_TASK_EXECUTE,
@@ -364,7 +622,7 @@ async def refine_story_task(
     if task.status != StoryEngineTaskStatus.COMPLETED:
         raise HTTPException(status_code=400, detail="Can only refine completed tasks")
     
-    refined = await refine_story_output(task, refine_data.feedback, refine_data.refine_type)
+    refined = await refine_story_output_llm(db, task, refine_data.feedback, refine_data.refine_type)
     
     # Create new task for refinement
     new_task = StoryEngineTask(
@@ -375,7 +633,7 @@ async def refine_story_task(
         context=refine_data.feedback,
         output=refined,
         status=StoryEngineTaskStatus.COMPLETED,
-        completed_at=datetime.utcnow()
+        completed_at=datetime.now(timezone.utc)
     )
     db.add(new_task)
     await db.commit()
@@ -419,7 +677,7 @@ async def delete_story_task(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Story engine task not found")
     
     create_audit_log(
-        db, current_user.id, AuditAction.STORY_ENGINE_TASK_CREATE,
+        db, current_user.id, AuditAction.STORY_ENGINE_TASK_DELETE,
         resource_type="story_engine_task", resource_id=task.id,
         ip_address=request.client.host if request.client else None,
         user_agent=request.headers.get("user-agent"),
@@ -428,3 +686,81 @@ async def delete_story_task(
     
     await db.delete(task)
     await db.commit()
+
+
+@router.post("/{project_id}/story-engine/tasks/{task_id}/apply", response_model=Dict[str, Any])
+async def apply_story_task(
+    project_id: str,
+    task_id: str,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Materialize a completed task's output into Episode rows (audit F-19).
+
+    Only GENERATE_OUTLINE / GENERATE_EPISODE outputs are applied: each
+    episode entry becomes an Episode row (existing episode_numbers are
+    skipped, never overwritten). Other task types return 400.
+    """
+    project = await get_project_or_404(project_id, current_user.id, db)
+
+    result = await db.execute(
+        select(StoryEngineTask).where(
+            StoryEngineTask.id == task_id,
+            StoryEngineTask.project_id == project_id
+        )
+    )
+    task = result.scalar_one_or_none()
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Story engine task not found")
+    if task.status != StoryEngineTaskStatus.COMPLETED or not task.output:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Can only apply completed tasks with output")
+
+    if task.task_type == StoryEngineTaskType.GENERATE_OUTLINE:
+        episodes_data = task.output.get("episodes") or []
+    elif task.task_type == StoryEngineTaskType.GENERATE_EPISODE:
+        episodes_data = [task.output]
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Task type {task.task_type.value} has no episode rows to apply"
+        )
+
+    existing_result = await db.execute(
+        select(Episode.episode_number).where(Episode.project_id == project_id)
+    )
+    existing_numbers = {row[0] for row in existing_result.all()}
+
+    created, skipped = [], []
+    for ep in episodes_data:
+        try:
+            number = int(ep.get("episode_number"))
+        except (TypeError, ValueError):
+            skipped.append({"episode": ep.get("title"), "reason": "missing episode_number"})
+            continue
+        if number in existing_numbers:
+            skipped.append({"episode_number": number, "reason": "already exists"})
+            continue
+        episode = Episode(
+            project_id=project_id,
+            episode_number=number,
+            title=(ep.get("title") or f"Episode {number}")[:255],
+            summary=ep.get("synopsis") or ep.get("logline"),
+            status=EpisodeStatus.OUTLINED,
+        )
+        db.add(episode)
+        existing_numbers.add(number)
+        created.append({"episode_number": number, "title": episode.title})
+
+    await db.commit()
+
+    create_audit_log(
+        db, current_user.id, AuditAction.STORY_ENGINE_TASK_UPDATE,
+        resource_type="story_engine_task", resource_id=task.id,
+        ip_address=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+        new_values={"applied_episodes": len(created), "skipped": len(skipped)}
+    )
+    await db.commit()
+
+    return {"created_episodes": created, "skipped": skipped}

@@ -1,7 +1,7 @@
 from sqlalchemy import Column, String, DateTime, Text, ForeignKey, Integer, Enum as SQLEnum, JSON
 from sqlalchemy.orm import relationship
 from app.core.database import Base
-from datetime import datetime
+from datetime import datetime, timezone
 import uuid
 import enum
 
@@ -52,6 +52,9 @@ class FlowBridgeTask(Base):
     output_assets = Column(Text, nullable=True)  # JSON array of generated asset IDs
     generation_log = Column(Text, nullable=True)  # JSON as text
     error_message = Column(Text, nullable=True)
+    # Google account fallback history: JSON list of
+    # {google_account_id, email, outcome, reason} attempts, most recent run.
+    fallback_history = Column(Text, nullable=True)
     
     # Automation
     automation_data = Column(Text, nullable=True)  # JSON for browser automation state
@@ -59,8 +62,8 @@ class FlowBridgeTask(Base):
     
     # Metadata
     priority = Column(Integer, default=0)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
     
@@ -103,8 +106,8 @@ class FlowBridgeAsset(Base):
     location_id = Column(String(36), ForeignKey("locations.id"), nullable=True, index=True)
     
     # Metadata
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
     
     task = relationship("FlowBridgeTask", back_populates="assets")
     project = relationship("Project")

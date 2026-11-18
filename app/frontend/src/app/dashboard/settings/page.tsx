@@ -2,10 +2,10 @@
 
 import { useState, useEffect } from 'react';
 import { useAuthStore, useGoogleAccountStore } from '@/store';
-import { authApi, googleAccountsApi, projectsApi } from '@/lib/api';
-import { User, Mail, Lock, Key, Save, AlertCircle, CheckCircle, Plus, Trash2, Edit, ExternalLink, RefreshCw, Settings, Shield, Database, Cloud, Download } from 'lucide-react';
+import { authApi, googleAccountsApi, projectsApi, settingsApi } from '@/lib/api';
+import { User, Mail, Lock, Key, Save, AlertCircle, CheckCircle, Plus, Trash2, Edit, ExternalLink, RefreshCw, Settings, Shield, Database, Cloud, Download, Cpu, Zap, GripVertical, Eye, EyeOff } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { useForm } from 'react-hook-form';
+import { useForm, useFieldArray } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
 
@@ -28,16 +28,57 @@ const googleAccountSchema = z.object({
   session_data: z.string().min(1, 'Session data is required'),
 });
 
+const aiProviderSchema = z.object({
+  id: z.string().min(1, 'ID is required'),
+  provider: z.string().min(1, 'Provider is required'),
+  model: z.string().min(1, 'Model is required'),
+  key_env: z.string().min(1, 'Key env var name is required'),
+  enabled: z.boolean(),
+  priority: z.number().int().min(1),
+});
+
+const aiProvidersSchema = z.object({
+  providers: z.array(aiProviderSchema).min(1, 'At least one provider is required'),
+});
+
+const oauthSchema = z.object({
+  google_oauth_client_id: z.string().min(1, 'Client ID is required'),
+  google_oauth_client_secret: z.string().min(1, 'Client Secret is required'),
+});
+
 type ProfileForm = z.infer<typeof profileSchema>;
 type PasswordForm = z.infer<typeof passwordSchema>;
 type GoogleAccountForm = z.infer<typeof googleAccountSchema>;
+type AIProvidersForm = z.infer<typeof aiProvidersSchema>;
+type OAuthForm = z.infer<typeof oauthSchema>;
+
+interface AIProviderConfig {
+  id: string;
+  provider: string;
+  model: string;
+  key_env: string;
+  enabled: boolean;
+  priority: number;
+  key_configured?: boolean;
+}
+
+interface AppSettingsResponse {
+  id: string;
+  ai_providers: AIProviderConfig[];
+  google_oauth_client_id_configured: boolean;
+  google_oauth_client_secret_configured: boolean;
+  created_at: string;
+  updated_at: string;
+}
 
 export default function SettingsPage() {
   const { user, token, updateUser } = useAuthStore();
   const { accounts, setAccounts, addAccount, updateAccount, removeAccount } = useGoogleAccountStore();
-  const [activeTab, setActiveTab] = useState<'profile' | 'security' | 'google' | 'data'>('profile');
+  const [activeTab, setActiveTab] = useState<'profile' | 'security' | 'google' | 'ai-providers' | 'oauth' | 'data'>('profile');
   const [isLoading, setIsLoading] = useState(false);
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [settings, setSettings] = useState<AppSettingsResponse | null>(null);
+  const [showClientSecret, setShowClientSecret] = useState(false);
 
   const profileForm = useForm<ProfileForm>({
     resolver: zodResolver(profileSchema),
@@ -55,6 +96,24 @@ export default function SettingsPage() {
     resolver: zodResolver(googleAccountSchema),
   });
 
+  const aiProvidersForm = useForm<AIProvidersForm>({
+    resolver: zodResolver(aiProvidersSchema),
+    defaultValues: {
+      providers: [{
+        id: 'nvidia-nemotron-550b',
+        provider: 'nvidia',
+        model: 'nvidia/nemotron-3-ultra-550b-a55b',
+        key_env: 'NVIDIA_API_KEY',
+        enabled: true,
+        priority: 1,
+      }],
+    },
+  });
+
+  const oauthForm = useForm<OAuthForm>({
+    resolver: zodResolver(oauthSchema),
+  });
+
   useEffect(() => {
     const loadGoogleAccounts = async () => {
       if (!token) return;
@@ -68,6 +127,28 @@ export default function SettingsPage() {
     loadGoogleAccounts();
   }, [token, setAccounts]);
 
+  useEffect(() => {
+    const loadSettings = async () => {
+      if (!token) return;
+      try {
+        const response = await settingsApi.get();
+        setSettings(response.data);
+        if (response.data.ai_providers) {
+          aiProvidersForm.reset({ providers: response.data.ai_providers });
+        }
+        if (response.data.google_oauth_client_id_configured && response.data.google_oauth_client_secret_configured) {
+          oauthForm.reset({
+            google_oauth_client_id: '••••••••',
+            google_oauth_client_secret: '••••••••',
+          });
+        }
+      } catch (err) {
+        console.error('Failed to load settings:', err);
+      }
+    };
+    loadSettings();
+  }, [token, aiProvidersForm, oauthForm]);
+
   const showMessage = (type: 'success' | 'error', text: string) => {
     setMessage({ type, text });
     setTimeout(() => setMessage(null), 5000);
@@ -76,7 +157,6 @@ export default function SettingsPage() {
   const handleProfileSubmit = async (data: ProfileForm) => {
     setIsLoading(true);
     try {
-      // Backend doesn't have profile update endpoint yet, just update local state
       updateUser({ full_name: data.full_name, email: data.email });
       showMessage('success', 'Profile updated successfully');
     } catch (err) {
@@ -89,8 +169,11 @@ export default function SettingsPage() {
   const handlePasswordSubmit = async (data: PasswordForm) => {
     setIsLoading(true);
     try {
-      // Backend doesn't have password change endpoint yet
-      showMessage('success', 'Password change feature coming soon');
+      await authApi.changePassword({
+        current_password: data.current_password,
+        new_password: data.new_password,
+      });
+      showMessage('success', 'Password changed successfully');
       passwordForm.reset();
     } catch (err) {
       showMessage('error', 'Failed to change password');
@@ -141,12 +224,70 @@ export default function SettingsPage() {
     }
   };
 
+  const handleAIProvidersSubmit = async (data: AIProvidersForm) => {
+    setIsLoading(true);
+    try {
+      await settingsApi.update({ ai_providers: data.providers });
+      showMessage('success', 'AI providers updated successfully');
+      const response = await settingsApi.get();
+      setSettings(response.data);
+    } catch (err: any) {
+      showMessage('error', err.response?.data?.detail || 'Failed to update AI providers');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleOAuthSubmit = async (data: OAuthForm) => {
+    setIsLoading(true);
+    try {
+      const updateData: any = {};
+      if (data.google_oauth_client_id !== '••••••••') {
+        updateData.google_oauth_client_id = data.google_oauth_client_id;
+      }
+      if (data.google_oauth_client_secret !== '••••••••') {
+        updateData.google_oauth_client_secret = data.google_oauth_client_secret;
+      }
+      await settingsApi.update(updateData);
+      showMessage('success', 'OAuth credentials updated successfully');
+      const response = await settingsApi.get();
+      setSettings(response.data);
+      oauthForm.reset({
+        google_oauth_client_id: '••••••••',
+        google_oauth_client_secret: '••••••••',
+      });
+      setShowClientSecret(false);
+    } catch (err: any) {
+      showMessage('error', err.response?.data?.detail || 'Failed to update OAuth credentials');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const { fields: providerFields, append: appendProvider, remove: removeProvider, move: moveProvider } = useFieldArray({
+    control: aiProvidersForm.control,
+    name: 'providers',
+  });
+
+  const addProvider = () => {
+    appendProvider({
+      id: `provider-${Date.now()}`,
+      provider: 'nvidia',
+      model: 'nvidia/nemotron-3-ultra-550b-a55b',
+      key_env: 'NVIDIA_API_KEY',
+      enabled: true,
+      priority: providerFields.length + 1,
+    });
+  };
+
   const tabs = [
     { id: 'profile', label: 'Profile', icon: User },
     { id: 'security', label: 'Security', icon: Shield },
     { id: 'google', label: 'Google Accounts', icon: Cloud },
+    { id: 'ai-providers', label: 'AI Providers', icon: Cpu },
+    { id: 'oauth', label: 'OAuth Credentials', icon: Key },
     { id: 'data', label: 'Data & Privacy', icon: Database },
-  ];
+  ]
 
   return (
     <div className="max-w-4xl mx-auto space-y-6">
@@ -170,13 +311,13 @@ export default function SettingsPage() {
       {/* Tab Navigation */}
       <div className="card">
         <div className="border-b border-dark-200 dark:border-dark-800">
-          <nav className="flex gap-1 p-1" aria-label="Settings tabs">
+          <nav className="flex gap-1 p-1 flex-wrap" aria-label="Settings tabs">
             {tabs.map((tab) => (
               <button
                 key={tab.id}
                 onClick={() => setActiveTab(tab.id as any)}
                 className={cn(
-                  'flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors',
+                  'flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors whitespace-nowrap',
                   activeTab === tab.id
                     ? 'bg-primary-100 dark:bg-primary-900/30 text-primary-700 dark:text-primary-400'
                     : 'text-dark-500 dark:text-dark-400 hover:text-dark-700 dark:hover:text-dark-200 hover:bg-dark-100 dark:hover:bg-dark-800'
@@ -392,6 +533,227 @@ export default function SettingsPage() {
                 )}
               </div>
             </div>
+          )}
+
+          {/* AI Providers Tab */}
+          {activeTab === 'ai-providers' && (
+            <form onSubmit={aiProvidersForm.handleSubmit(handleAIProvidersSubmit)} className="space-y-6">
+              <div>
+                <label className="label">AI Providers Configuration</label>
+                <p className="text-sm text-dark-500 dark:text-dark-400">
+                  Configure the list of AI providers and their fallback order. Providers are tried in priority order (lower = higher priority).
+                  API keys are read from environment variables (e.g., NVIDIA_API_KEY) and are never stored in the database.
+                </p>
+              </div>
+
+              <div className="card p-4">
+                <div className="flex items-center justify-between mb-4">
+                  <h3 className="font-medium text-dark-900 dark:text-white">Providers (Fallback Order)</h3>
+                  <button
+                    type="button"
+                    onClick={addProvider}
+                    className="btn-secondary text-sm"
+                    disabled={isLoading}
+                  >
+                    <Plus className="w-4 h-4 mr-2" />
+                    Add Provider
+                  </button>
+                </div>
+
+                <div className="space-y-3">
+                  {providerFields.map((field, index) => (
+                    <div key={field.id} className="card p-4 bg-dark-50 dark:bg-dark-800/50">
+                      <div className="flex items-start gap-4">
+                        <div className="flex items-center gap-2 text-dark-400 pt-2">
+                          <GripVertical className="w-5 h-5 cursor-grab" />
+                          <span className="font-mono text-sm">{index + 1}</span>
+                        </div>
+                        <div className="flex-1 space-y-3">
+                          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+                            <div>
+                              <label className="label text-xs">Provider ID</label>
+                              <input
+                                {...aiProvidersForm.register(`providers.${index}.id`)}
+                                className="input text-sm"
+                                placeholder="e.g., nvidia-nemotron-550b"
+                              />
+                            </div>
+                            <div>
+                              <label className="label text-xs">Provider</label>
+                              <select
+                                {...aiProvidersForm.register(`providers.${index}.provider`)}
+                                className="input text-sm"
+                              >
+                                <option value="nvidia">NVIDIA NIM</option>
+                              </select>
+                            </div>
+                            <div>
+                              <label className="label text-xs">Model</label>
+                              <input
+                                {...aiProvidersForm.register(`providers.${index}.model`)}
+                                className="input text-sm"
+                                placeholder="e.g., nvidia/nemotron-3-ultra-550b-a55b"
+                              />
+                            </div>
+                            <div>
+                              <label className="label text-xs">Key Env Var</label>
+                              <input
+                                {...aiProvidersForm.register(`providers.${index}.key_env`)}
+                                className="input text-sm font-mono"
+                                placeholder="e.g., NVIDIA_API_KEY"
+                              />
+                            </div>
+                            <div>
+                              <label className="label text-xs">Priority</label>
+                              <input
+                                type="number"
+                                min="1"
+                                {...aiProvidersForm.register(`providers.${index}.priority`, { valueAsNumber: true })}
+                                className="input text-sm w-24"
+                              />
+                            </div>
+                            <div className="flex items-end">
+                              <label className="flex items-center gap-2 cursor-pointer">
+                                <input
+                                  type="checkbox"
+                                  {...aiProvidersForm.register(`providers.${index}.enabled`)}
+                                  className="rounded border-dark-300 text-primary-600"
+                                />
+                                <span className="text-sm text-dark-700 dark:text-dark-300">Enabled</span>
+                              </label>
+                            </div>
+                          </div>
+                          {settings?.ai_providers[index]?.key_configured !== undefined && (
+                            <div className="flex items-center gap-2 text-sm">
+                              <span className={settings.ai_providers[index].key_configured 
+                                ? 'text-green-600 dark:text-green-400' 
+                                : 'text-red-600 dark:text-red-400'}>
+                                {settings.ai_providers[index].key_configured ? (
+                                  <>✓ API key configured in environment</>
+                                ) : (
+                                  <>✗ API key NOT configured (set {settings.ai_providers[index].key_env} in .env)</>
+                                )}
+                              </span>
+                            </div>
+                          )}
+                        </div>
+                        <div className="flex flex-col items-end gap-2">
+                          {providerFields.length > 1 && (
+                            <button
+                              type="button"
+                              onClick={() => removeProvider(index)}
+                              className="p-2 text-dark-400 hover:text-red-600 hover:bg-dark-100 dark:hover:bg-dark-800 rounded transition-colors"
+                              title="Remove provider"
+                              disabled={isLoading}
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => moveProvider(index, index - 1)}
+                            disabled={index === 0 || isLoading}
+                            className="p-2 text-dark-400 hover:text-dark-600 hover:bg-dark-100 dark:hover:bg-dark-800 rounded transition-colors disabled:opacity-50"
+                            title="Move up"
+                          >
+                            <Zap className="w-4 h-4 rotate-90" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => moveProvider(index, index + 1)}
+                            disabled={index === providerFields.length - 1 || isLoading}
+                            className="p-2 text-dark-400 hover:text-dark-600 hover:bg-dark-100 dark:hover:bg-dark-800 rounded transition-colors disabled:opacity-50"
+                            title="Move down"
+                          >
+                            <Zap className="w-4 h-4 -rotate-90" />
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="pt-4 border-t border-dark-200 dark:border-dark-800">
+                <button type="submit" className="btn-primary" disabled={isLoading}>
+                  <Save className="w-4 h-4 mr-2" />
+                  {isLoading ? 'Saving...' : 'Save AI Providers'}
+                </button>
+              </div>
+            </form>
+          )}
+
+          {/* OAuth Credentials Tab */}
+          {activeTab === 'oauth' && (
+            <form onSubmit={oauthForm.handleSubmit(handleOAuthSubmit)} className="space-y-6">
+              <div>
+                <label className="label">Google OAuth Credentials</label>
+                <p className="text-sm text-dark-500 dark:text-dark-400">
+                  Configure Google OAuth 2.0 client credentials for the authorization flow.
+                  These are encrypted at rest and never exposed in API responses.
+                  Get credentials from <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noopener noreferrer" className="text-primary-600 hover:underline">Google Cloud Console</a>.
+                </p>
+              </div>
+
+              <div className="card p-4">
+                <div className="space-y-4">
+                  <div>
+                    <label htmlFor="oauth_client_id" className="label">Client ID</label>
+                    <div className="relative">
+                      <input
+                        {...oauthForm.register('google_oauth_client_id')}
+                        id="oauth_client_id"
+                        type={showClientSecret ? 'text' : 'password'}
+                        className="input pr-12"
+                        placeholder="Enter Google OAuth Client ID"
+                        disabled={settings?.google_oauth_client_id_configured && !showClientSecret}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowClientSecret(!showClientSecret)}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-dark-400 hover:text-dark-600"
+                      >
+                        {showClientSecret ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
+                      </button>
+                    </div>
+                    {settings?.google_oauth_client_id_configured && !showClientSecret && (
+                      <p className="mt-1 text-sm text-green-600 dark:text-green-400">✓ Client ID configured (hidden)</p>
+                    )}
+                  </div>
+
+                  <div>
+                    <label htmlFor="oauth_client_secret" className="label">Client Secret</label>
+                    <div className="relative">
+                      <input
+                        {...oauthForm.register('google_oauth_client_secret')}
+                        id="oauth_client_secret"
+                        type={showClientSecret ? 'text' : 'password'}
+                        className="input pr-12"
+                        placeholder="Enter Google OAuth Client Secret"
+                        disabled={settings?.google_oauth_client_secret_configured && !showClientSecret}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowClientSecret(!showClientSecret)}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-dark-400 hover:text-dark-600"
+                      >
+                        {showClientSecret ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
+                      </button>
+                    </div>
+                    {settings?.google_oauth_client_secret_configured && !showClientSecret && (
+                      <p className="mt-1 text-sm text-green-600 dark:text-green-400">✓ Client Secret configured (hidden)</p>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              <div className="pt-4 border-t border-dark-200 dark:border-dark-800">
+                <button type="submit" className="btn-primary" disabled={isLoading}>
+                  <Save className="w-4 h-4 mr-2" />
+                  {isLoading ? 'Saving...' : 'Save OAuth Credentials'}
+                </button>
+              </div>
+            </form>
           )}
 
           {/* Data & Privacy Tab */}

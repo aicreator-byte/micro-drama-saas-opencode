@@ -3,64 +3,17 @@ from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from typing import Optional
-from datetime import timedelta
+from datetime import timedelta, timezone
 
 from app.core.database import get_db
 from app.core.security import verify_password, get_password_hash, create_access_token, decode_access_token
 from app.core.config import settings
 from app.models.user import User
-from app.schemas.user import UserCreate, UserResponse, Token, TokenData
+from app.schemas.user import UserCreate, UserResponse, Token, TokenData, PasswordChange
 from app.models.audit_log import AuditLog, AuditAction
+from app.api.deps import get_current_user  # single implementation (was duplicated here)
 
 router = APIRouter()
-
-
-async def get_current_user(
-    request: Request,
-    db: AsyncSession = Depends(get_db)
-) -> User:
-    auth_header = request.headers.get("Authorization")
-    if not auth_header or not auth_header.startswith("Bearer "):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Not authenticated",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    
-    token = auth_header.split(" ")[1]
-    payload = decode_access_token(token)
-    if not payload:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    
-    user_id = payload.get("sub")
-    if not user_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token payload",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    
-    result = await db.execute(select(User).where(User.id == user_id))
-    user = result.scalar_one_or_none()
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User not found",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    
-    if not user.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Inactive user",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    
-    return user
 
 
 async def get_current_user_optional(
@@ -120,10 +73,18 @@ async def register(
     
     # Create user
     hashed_password = get_password_hash(user_data.password)
+    # Bootstrap: if no superuser exists yet (fresh install), the first
+    # registered user becomes superuser so /settings is reachable without
+    # manual DB edits (audit F-07 / O-P0-06).
+    existing_superuser = await db.execute(
+        select(User).where(User.is_superuser == True).limit(1)  # noqa: E712
+    )
+    is_first_superuser = existing_superuser.scalar_one_or_none() is None
     user = User(
         email=user_data.email,
         full_name=user_data.full_name,
-        hashed_password=hashed_password
+        hashed_password=hashed_password,
+        is_superuser=is_first_superuser,
     )
     db.add(user)
     await db.commit()
@@ -135,11 +96,47 @@ async def register(
         resource_type="user", resource_id=user.id,
         ip_address=request.client.host if request.client else None,
         user_agent=request.headers.get("user-agent"),
-        new_values={"email": user.email, "full_name": user.full_name}
+        new_values={"email": user.email, "full_name": user.full_name, "is_superuser": user.is_superuser}
     )
     await db.commit()
-    
+
     return user
+
+
+@router.post("/change-password")
+async def change_password(
+    password_data: PasswordChange,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Change the current user's password (audit F-24)."""
+    if not verify_password(password_data.current_password, current_user.hashed_password):
+        create_audit_log(
+            db, current_user.id, AuditAction.PASSWORD_CHANGE,
+            resource_type="user", resource_id=current_user.id,
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            success=False,
+            error_message="Current password incorrect"
+        )
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Current password is incorrect"
+        )
+
+    current_user.hashed_password = get_password_hash(password_data.new_password)
+    await db.commit()
+
+    create_audit_log(
+        db, current_user.id, AuditAction.PASSWORD_CHANGE,
+        resource_type="user", resource_id=current_user.id,
+        ip_address=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent")
+    )
+    await db.commit()
+    return {"message": "Password changed successfully"}
 
 
 @router.post("/login", response_model=Token)
@@ -179,7 +176,7 @@ async def login(
     
     # Update last login
     from datetime import datetime
-    user.last_login = datetime.utcnow()
+    user.last_login = datetime.now(timezone.utc)
     
     # Create access token
     access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)

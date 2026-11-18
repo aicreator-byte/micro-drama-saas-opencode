@@ -1,7 +1,7 @@
 from sqlalchemy import Column, String, DateTime, Text, ForeignKey, Integer, Boolean, Enum as SQLEnum
 from sqlalchemy.orm import relationship
 from app.core.database import Base
-from datetime import datetime
+from datetime import datetime, timezone
 import uuid
 import enum
 
@@ -29,6 +29,9 @@ class GoogleAccount(Base):
     encrypted_session_data = Column(Text, nullable=True)
     session_expires_at = Column(DateTime, nullable=True)
     
+    # Encrypted password for Flow Bridge automation
+    password_encrypted = Column(Text, nullable=True)
+    
     # Status
     status = Column(SQLEnum(GoogleAccountStatus), default=GoogleAccountStatus.DISCONNECTED, nullable=False)
     last_verified_at = Column(DateTime, nullable=True)
@@ -39,8 +42,8 @@ class GoogleAccount(Base):
     last_used_at = Column(DateTime, nullable=True)
     
     # Metadata
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
     connected_at = Column(DateTime, nullable=True)
     disconnected_at = Column(DateTime, nullable=True)
     

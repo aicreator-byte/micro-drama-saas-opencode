@@ -91,13 +91,33 @@ class FlowBridgeTaskResponse(FlowBridgeTaskBase):
     error_message: Optional[str] = None
     automation_data: Optional[Union[Dict[str, Any], str]] = None
     manual_steps_completed: Optional[Union[List[str], str]] = None
+    # Google account fallback history: JSON list of
+    # {google_account_id, email, outcome, reason} attempts.
+    fallback_history: Optional[Union[List[Dict[str, Any]], str]] = None
     created_at: datetime
     updated_at: datetime
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
-    
+
+    @field_validator('fallback_history', mode='before')
+    @classmethod
+    def parse_fallback_history_if_string(cls, v):
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except (json.JSONDecodeError, TypeError):
+                return v
+        return v
+
     class Config:
         from_attributes = True
+
+
+class FlowBridgeTaskExecuteRequest(BaseModel):
+    """Optional preferred Google account for execute/retry; when omitted
+    the task's current account is tried first, then the user's other
+    connected accounts in least-recently-used order."""
+    google_account_id: Optional[str] = None
 
 
 class FlowBridgeAssetBase(BaseModel):

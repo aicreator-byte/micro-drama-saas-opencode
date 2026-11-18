@@ -103,6 +103,9 @@ export interface Character {
   motivations: string | null;
   fears: string | null;
   quirks: string | null;
+  voice_pattern: string | null;
+  physical_traits: string | null;
+  skills: string[] | null;
   costume_style: string | null;
   signature_items: string[] | null;
   color_palette: string[] | null;

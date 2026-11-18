@@ -55,7 +55,10 @@ export const authApi = {
   
   logout: () =>
     api.post('/auth/logout'),
-  
+
+  changePassword: (data: { current_password: string; new_password: string }) =>
+    api.post('/auth/change-password', data),
+
   getMe: () =>
     api.get('/auth/me'),
 };
@@ -219,6 +222,13 @@ export const googleAccountsApi = {
   
   verify: (id: string) =>
     api.post(`/google-accounts/${id}/verify`),
+  
+  // OAuth endpoints
+  authorize: () =>
+    api.get('/google-accounts/oauth/authorize'),
+  
+  refresh: (id: string) =>
+    api.post(`/google-accounts/${id}/refresh`),
 };
 
 // Flow Bridge API
@@ -275,7 +285,77 @@ export const exportApi = {
     api.get(`/projects/${projectId}/export/prompts`, { params: { format } }),
   
   download: (projectId: string, exportId: string) =>
-    api.get(`/projects/${projectId}/export/${exportId}/download`),
+    api.get(`/projects/${projectId}/export/${exportId}/download`, { responseType: 'blob' }),
+};
+
+// Story Engine API
+export const storyEngineApi = {
+  list: (projectId: string) =>
+    api.get(`/projects/${projectId}/story-engine/tasks`),
+
+  create: (projectId: string, data: { task_type: string; series_bible_id: string; parameters?: Record<string, unknown>; context?: string }) =>
+    api.post(`/projects/${projectId}/story-engine/tasks`, data),
+
+  get: (projectId: string, taskId: string) =>
+    api.get(`/projects/${projectId}/story-engine/tasks/${taskId}`),
+
+  execute: (projectId: string, taskId: string) =>
+    api.post(`/projects/${projectId}/story-engine/tasks/${taskId}/execute`),
+
+  apply: (projectId: string, taskId: string) =>
+    api.post(`/projects/${projectId}/story-engine/tasks/${taskId}/apply`),
+
+  delete: (projectId: string, taskId: string) =>
+    api.delete(`/projects/${projectId}/story-engine/tasks/${taskId}`),
+};
+
+// Scene Engine API
+export const sceneEngineApi = {
+  list: (projectId: string) =>
+    api.get(`/projects/${projectId}/scene-engine/tasks`),
+
+  create: (projectId: string, data: { task_type: string; episode_id: string; scene_id?: string; parameters?: Record<string, unknown>; context?: string }) =>
+    api.post(`/projects/${projectId}/scene-engine/tasks`, data),
+
+  get: (projectId: string, taskId: string) =>
+    api.get(`/projects/${projectId}/scene-engine/tasks/${taskId}`),
+
+  execute: (projectId: string, taskId: string) =>
+    api.post(`/projects/${projectId}/scene-engine/tasks/${taskId}/execute`),
+
+  apply: (projectId: string, taskId: string) =>
+    api.post(`/projects/${projectId}/scene-engine/tasks/${taskId}/apply`),
+
+  delete: (projectId: string, taskId: string) =>
+    api.delete(`/projects/${projectId}/scene-engine/tasks/${taskId}`),
+};
+
+// Dialogues API (per scene)
+export const dialoguesApi = {
+  list: (projectId: string, episodeId: string, sceneId: string) =>
+    api.get(`/projects/${projectId}/episodes/${episodeId}/scenes/${sceneId}/dialogues`),
+};
+
+// Episode revisions API
+export const episodeRevisionsApi = {
+  list: (projectId: string, episodeId: string) =>
+    api.get(`/projects/${projectId}/episodes/${episodeId}/revisions`),
+
+  create: (projectId: string, episodeId: string, data: { change_notes?: string }) =>
+    api.post(`/projects/${projectId}/episodes/${episodeId}/revisions`, data),
+};
+
+// Settings API
+export const settingsApi = {
+  get: () =>
+    api.get('/settings'),
+  
+  update: (data: {
+    ai_providers?: Array<{ id: string; provider: string; model: string; key_env: string; enabled: boolean; priority: number }>;
+    google_oauth_client_id?: string;
+    google_oauth_client_secret?: string;
+  }) =>
+    api.patch('/settings', data),
 };
 
 export default api;

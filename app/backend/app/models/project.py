@@ -1,7 +1,7 @@
 from sqlalchemy import Column, String, DateTime, Text, Integer, ForeignKey, Enum as SQLEnum
 from sqlalchemy.orm import relationship
 from app.core.database import Base
-from datetime import datetime
+from datetime import datetime, timezone
 import uuid
 import enum
 
@@ -24,8 +24,8 @@ class Project(Base):
     themes = Column(Text, nullable=True)  # JSON array as text
     status = Column(SQLEnum(ProjectStatus), default=ProjectStatus.DRAFT, nullable=False)
     total_episodes = Column(Integer, default=20)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
     
     owner = relationship("User", back_populates="projects")
     series_bible = relationship("SeriesBible", back_populates="project", uselist=False, cascade="all, delete-orphan")

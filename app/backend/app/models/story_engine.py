@@ -1,7 +1,7 @@
 from sqlalchemy import Column, String, Text, DateTime, Enum as SQLEnum, ForeignKey, JSON, Index
 from sqlalchemy.orm import relationship
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from app.core.database import Base
 import enum
 
@@ -34,8 +34,8 @@ class StoryEngineTask(Base):
     context = Column(Text, nullable=True)
     output = Column(JSON, nullable=True)
     error_message = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc), nullable=False)
     completed_at = Column(DateTime, nullable=True)
 
     project = relationship("Project", backref="story_engine_tasks")

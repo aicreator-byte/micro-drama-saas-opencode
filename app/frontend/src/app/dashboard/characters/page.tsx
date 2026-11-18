@@ -75,10 +75,6 @@ export default function CharactersPage() {
         const response = await charactersApi.update(currentProject.id, editingCharacter.id, payload);
         updateCharacter(response.data.id, response.data);
       } else {
-        if (characters.length >= 6) {
-          alert('Maximum of 6 characters allowed per project');
-          return;
-        }
         const response = await charactersApi.create(currentProject.id, payload);
         addCharacter(response.data);
       }
@@ -140,10 +136,10 @@ export default function CharactersPage() {
             setShowCreateModal(true);
           }}
           className="btn-primary"
-          disabled={!currentProject || characters.length >= 6}
+          disabled={!currentProject}
         >
           <UserPlus className="w-4 h-4 mr-2" />
-          {characters.length >= 6 ? 'Max Characters (6)' : 'Add Character'}
+          Add Character
         </button>
       </div>
 
@@ -178,9 +174,9 @@ export default function CharactersPage() {
               {search ? 'No characters found' : 'No characters yet'}
             </h3>
             <p className="text-dark-500 dark:text-dark-400 mb-6">
-              {search ? 'Try adjusting your search' : `Add up to 6 characters to ${currentProject.title}`}
+              {search ? 'Try adjusting your search' : `Add characters to ${currentProject.title}`}
             </p>
-            {!search && characters.length < 6 && (
+            {!search && (
               <button
                 onClick={() => {
                   reset();

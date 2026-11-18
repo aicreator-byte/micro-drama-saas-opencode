@@ -27,6 +27,11 @@ class CharacterBase(BaseModel):
     motivations: Optional[str] = None
     fears: Optional[str] = None
     quirks: Optional[str] = None
+
+    # Voice & physicality (used by Scene Engine dialogue/action prompts)
+    voice_pattern: Optional[str] = None
+    physical_traits: Optional[str] = None
+    skills: Optional[Union[List[str], str]] = None
     
     # Costume
     costume_style: Optional[str] = None
@@ -37,7 +42,7 @@ class CharacterBase(BaseModel):
     reference_images: Optional[Union[List[str], str]] = None
     consistency_instructions: Optional[str] = None
 
-    @field_validator('personality_traits', 'signature_items', 'color_palette', 'reference_images', mode='before')
+    @field_validator('personality_traits', 'signature_items', 'color_palette', 'reference_images', 'skills', mode='before')
     @classmethod
     def parse_json_if_string(cls, v):
         if isinstance(v, str):
@@ -71,6 +76,9 @@ class CharacterUpdate(BaseModel):
     motivations: Optional[str] = None
     fears: Optional[str] = None
     quirks: Optional[str] = None
+    voice_pattern: Optional[str] = None
+    physical_traits: Optional[str] = None
+    skills: Optional[List[str]] = None
     costume_style: Optional[str] = None
     signature_items: Optional[List[str]] = None
     color_palette: Optional[List[str]] = None

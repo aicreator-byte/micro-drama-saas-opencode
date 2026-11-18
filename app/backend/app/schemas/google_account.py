@@ -21,6 +21,7 @@ class GoogleAccountUpdate(BaseModel):
     status: Optional[GoogleAccountStatus] = None
     encrypted_session_data: Optional[str] = None
     session_expires_at: Optional[datetime] = None
+    password: Optional[str] = Field(None, max_length=500)  # Plaintext password, will be encrypted on save
 
 
 class GoogleAccountResponse(GoogleAccountBase):
@@ -49,3 +50,13 @@ class GoogleAccountConnectRequest(BaseModel):
 class GoogleAccountSessionUpdate(BaseModel):
     encrypted_session_data: str
     expires_at: Optional[datetime] = None
+
+
+class GoogleOAuthAuthorizeResponse(BaseModel):
+    authorize_url: str
+    state: str
+
+
+class GoogleOAuthTokenResponse(BaseModel):
+    status: str
+    expires_at: Optional[str] = None

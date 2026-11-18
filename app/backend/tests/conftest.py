@@ -268,3 +268,25 @@ async def test_prompt(db_session, test_project):
     await db_session.commit()
     await db_session.refresh(prompt)
     return prompt
+
+
+@pytest_asyncio.fixture
+async def test_settings_with_mock(db_session):
+    """Create AppSettings with mock AI provider for testing."""
+    from app.models.settings import AppSettings
+    settings = AppSettings(
+        ai_providers=[
+            {
+                "id": "mock-provider",
+                "provider": "mock",
+                "model": "mock-model",
+                "key_env": "MOCK_API_KEY",
+                "enabled": True,
+                "priority": 1,
+            }
+        ]
+    )
+    db_session.add(settings)
+    await db_session.commit()
+    await db_session.refresh(settings)
+    return settings

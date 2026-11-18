@@ -1,4 +1,4 @@
-from app.api.v1 import auth, projects, series_bible, characters, locations, episodes, prompts, google_accounts, flow_bridge, audit_logs, story_engine, scene_engine, export, flow_bridge_automation
+from app.api.v1 import auth, projects, series_bible, characters, locations, episodes, prompts, google_accounts, flow_bridge, audit_logs, story_engine, scene_engine, export, flow_bridge_automation, settings
 from fastapi import APIRouter
 
 api_router = APIRouter()
@@ -17,3 +17,4 @@ api_router.include_router(scene_engine.router, prefix="/projects", tags=["Scene 
 api_router.include_router(export.router, prefix="/projects", tags=["Export"])
 api_router.include_router(flow_bridge_automation.router, prefix="/projects", tags=["Flow Bridge Automation"])
 api_router.include_router(audit_logs.router, prefix="/audit-logs", tags=["Audit Logs"])
+api_router.include_router(settings.router, prefix="", tags=["Settings"])

@@ -197,3 +197,55 @@ class TestExport:
             "format": "json"
         }, headers=auth_headers)
         assert response.status_code == 404
+
+class TestExportDownload:
+    """Audit F-15/F-16/P1-08: download was a 307 stub; history missed types."""
+
+    @pytest.mark.asyncio
+    async def test_download_export_returns_file(
+        self, client: AsyncClient, auth_headers, test_project, test_character
+    ):
+        create = await client.post(f"/api/v1/projects/{test_project.id}/export", json={
+            "export_type": "characters", "format": "json",
+        }, headers=auth_headers)
+        assert create.status_code == 201
+        export_id = create.json()["export_id"]
+
+        # History now includes all 8 export types (was: only 3).
+        history = await client.get(
+            f"/api/v1/projects/{test_project.id}/export/history", headers=auth_headers)
+        assert history.status_code == 200
+        assert any(e["export_id"] == export_id for e in history.json())
+
+        download = await client.get(
+            f"/api/v1/projects/{test_project.id}/export/{export_id}/download",
+            headers=auth_headers)
+        assert download.status_code == 200, download.text
+        assert "attachment" in download.headers.get("content-disposition", "")
+        import json as _json
+        body = _json.loads(download.content)
+        assert body["characters"][0]["name"] == "John Doe"
+
+    @pytest.mark.asyncio
+    async def test_export_csv_is_real_csv(
+        self, client: AsyncClient, auth_headers, test_project, test_character
+    ):
+        create = await client.post(f"/api/v1/projects/{test_project.id}/export", json={
+            "export_type": "characters", "format": "csv",
+        }, headers=auth_headers)
+        assert create.status_code == 201
+        file_url = create.json()["file_url"]
+        assert file_url.startswith("data:text/csv;base64,")
+        import base64, csv, io
+        content = base64.b64decode(file_url.split(";base64,", 1)[1]).decode()
+        rows = list(csv.DictReader(io.StringIO(content)))
+        assert rows and rows[0]["name"] == "John Doe"
+
+    @pytest.mark.asyncio
+    async def test_download_unknown_export_404(
+        self, client: AsyncClient, auth_headers, test_project
+    ):
+        response = await client.get(
+            f"/api/v1/projects/{test_project.id}/export/does-not-exist/download",
+            headers=auth_headers)
+        assert response.status_code == 404

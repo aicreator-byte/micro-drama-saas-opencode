@@ -294,9 +294,9 @@ async def use_prompt(
             detail="Prompt not found"
         )
     
-    from datetime import datetime
+    from datetime import datetime, timezone
     prompt.times_used += 1
-    prompt.last_used_at = datetime.utcnow()
+    prompt.last_used_at = datetime.now(timezone.utc)
     prompt.status = PromptStatus.USED
     
     await db.commit()

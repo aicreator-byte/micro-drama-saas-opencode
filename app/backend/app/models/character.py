@@ -1,7 +1,7 @@
 from sqlalchemy import Column, String, DateTime, Text, Integer, ForeignKey
 from sqlalchemy.orm import relationship
 from app.core.database import Base
-from datetime import datetime
+from datetime import datetime, timezone
 import uuid
 
 
@@ -34,6 +34,10 @@ class Character(Base):
     motivations = Column(Text, nullable=True)
     fears = Column(Text, nullable=True)
     quirks = Column(Text, nullable=True)
+    # Voice & physicality (used by Scene Engine dialogue/action prompts)
+    voice_pattern = Column(Text, nullable=True)
+    physical_traits = Column(Text, nullable=True)
+    skills = Column(Text, nullable=True)  # JSON array as text
     
     # Costume
     costume_style = Column(Text, nullable=True)
@@ -45,7 +49,7 @@ class Character(Base):
     consistency_instructions = Column(Text, nullable=True)
     
     # Metadata
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
     
     project = relationship("Project", back_populates="characters")

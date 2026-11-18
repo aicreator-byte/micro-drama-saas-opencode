@@ -1,7 +1,7 @@
 from sqlalchemy import Column, String, DateTime, Text, ForeignKey, Enum as SQLEnum, Boolean
 from sqlalchemy.orm import relationship
 from app.core.database import Base
-from datetime import datetime
+from datetime import datetime, timezone
 import uuid
 import enum
 
@@ -54,6 +54,13 @@ class AuditAction(str, enum.Enum):
     SHOT_READ = "shot_read"
     SHOT_UPDATE = "shot_update"
     SHOT_DELETE = "shot_delete"
+
+    # Dialogue
+    DIALOGUE_CREATE = "dialogue_create"
+    DIALOGUE_DELETE = "dialogue_delete"
+
+    # Episode revision
+    EPISODE_REVISION_CREATE = "episode_revision_create"
     
     # Prompt
     PROMPT_CREATE = "prompt_create"
@@ -79,18 +86,28 @@ class AuditAction(str, enum.Enum):
     EXPORT_PROJECT = "export_project"
     EXPORT_EPISODE = "export_episode"
     EXPORT_PROMPTS = "export_prompts"
-    
+    EXPORT_SERIES_BIBLE = "export_series_bible"
+    EXPORT_CHARACTERS = "export_characters"
+    EXPORT_LOCATIONS = "export_locations"
+    EXPORT_SCENES = "export_scenes"
+    EXPORT_FULL_PROJECT = "export_full_project"
+
+    # Settings
+    SETTINGS_UPDATE = "settings_update"
+
     # Story Engine
     STORY_ENGINE_TASK_CREATE = "story_engine_task_create"
     STORY_ENGINE_TASK_READ = "story_engine_task_read"
     STORY_ENGINE_TASK_UPDATE = "story_engine_task_update"
     STORY_ENGINE_TASK_EXECUTE = "story_engine_task_execute"
-    
+    STORY_ENGINE_TASK_DELETE = "story_engine_task_delete"
+
     # Scene Engine
     SCENE_ENGINE_TASK_CREATE = "scene_engine_task_create"
     SCENE_ENGINE_TASK_READ = "scene_engine_task_read"
     SCENE_ENGINE_TASK_UPDATE = "scene_engine_task_update"
     SCENE_ENGINE_TASK_EXECUTE = "scene_engine_task_execute"
+    SCENE_ENGINE_TASK_DELETE = "scene_engine_task_delete"
 
 
 class AuditLog(Base):
@@ -118,6 +135,6 @@ class AuditLog(Base):
     error_message = Column(Text, nullable=True)
     
     # Metadata
-    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
     
     user = relationship("User", back_populates="audit_logs")

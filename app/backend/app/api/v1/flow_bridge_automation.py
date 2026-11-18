@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, Request, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from typing import List, Optional, Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
 import uuid
 
 from app.core.database import get_db
@@ -16,6 +16,23 @@ from app.services.flow_bridge_automation import (
     BrowserAutomationService, AutomationTaskType, AutomationStatus,
     get_automation_service
 )
+
+router = APIRouter()
+
+
+def _require_real_automation(automation: BrowserAutomationService):
+    """Fail closed while browser automation is mock-only (audit F-02).
+
+    The automation service ships with mock_mode=True and no real Playwright
+    run path; its fake results must never touch production data. All
+    mutating automation endpoints return 503 until real automation is
+    enabled via env (FLOW_AUTOMATION_ENABLED=1 + Playwright available).
+    """
+    if automation.mock_mode:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Browser automation is unavailable (mock mode): real Playwright automation is not enabled"
+        )
 from app.schemas.flow_bridge_automation import (
     LoginAutomationRequest, ImageGenerationRequest, AccountCheckRequest,
     SessionRefreshRequest, AutomationTaskResponse, AutomationTaskListResponse,
@@ -63,34 +80,51 @@ async def create_login_automation(
     """Create and execute Google login automation."""
     project = await get_project_or_404(project_id, current_user.id, db)
     google_account = await get_google_account_or_404(login_data.google_account_id, current_user.id, db)
-    
-    parameters = {
-        "email": google_account.email,
-        "password": "***",
-        "session_data": google_account.encrypted_session_data
-    }
-    
+    _require_real_automation(automation)
+
+    # Real-mode login goes through BrowserFlowService: per-account
+    # persistent browser profile, password decrypted from the existing
+    # encrypted column (never a literal placeholder — audit: the old
+    # code passed "***", which real Playwright would have typed into
+    # Google's login form). No Cloud Console credentials involved.
+    # The AutomationTask below is only the record for the response;
+    # the session lives in the account's browser profile on disk, NOT
+    # in encrypted_session_data (the old code stored raw cookies there
+    # unencrypted).
+    from app.services.browser_flow import (
+        BrowserUnavailable, FlowDomError, get_browser_flow_service)
+    from app.services.google_account_fallback import GoogleAccountFailure
+
     task = automation.create_task(
         task_type=AutomationTaskType.LOGIN_GOOGLE,
         google_account_id=login_data.google_account_id,
         project_id=project_id,
-        parameters=parameters
+        parameters={"email": google_account.email},
     )
-    
+    browser_flow = get_browser_flow_service()
     try:
-        result_task = await automation.execute_task(task.task_id)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Automation failed: {str(e)}")
-    
-    if result_task.status == AutomationStatus.COMPLETED and result_task.result_data:
-        cookies = result_task.result_data.get("cookies", google_account.encrypted_session_data)
-        if isinstance(cookies, dict):
-            import json
-            cookies = json.dumps(cookies)
-        google_account.encrypted_session_data = cookies
-        google_account.last_used_at = datetime.utcnow()
-        google_account.status = GoogleAccountStatus.CONNECTED
-        await db.commit()
+        login_result = await browser_flow.login_account(db, google_account)
+    except BrowserUnavailable as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Browser automation is unavailable: {e}")
+    except FlowDomError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Browser automation could not reach Google: {e}")
+    except GoogleAccountFailure as e:
+        task.status = AutomationStatus.FAILED
+        task.error_message = e.reason
+        task.completed_at = datetime.now(timezone.utc)
+        result_task = task
+    else:
+        task.status = AutomationStatus.COMPLETED
+        task.completed_at = datetime.now(timezone.utc)
+        task.result_data = login_result.as_dict()
+        for step in task.steps:
+            step.completed = True
+        task.current_step = len(task.steps)
+        result_task = task
     
     create_audit_log(
         db, current_user.id, AuditAction.GOOGLE_ACCOUNT_VERIFY,
@@ -141,6 +175,7 @@ async def create_image_generation_automation(
     """Create and execute AI image generation automation."""
     project = await get_project_or_404(project_id, current_user.id, db)
     google_account = await get_google_account_or_404(gen_data.google_account_id, current_user.id, db)
+    _require_real_automation(automation)
     
     ft_result = await db.execute(
         select(FlowBridgeTask).where(FlowBridgeTask.id == gen_data.flow_task_id, FlowBridgeTask.project_id == project_id)
@@ -169,11 +204,11 @@ async def create_image_generation_automation(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Automation failed: {str(e)}")
     
-    if result_task.status == AutomationStatus.COMPLETED and result_task.result_data:
+    if result_task.status == AutomationStatus.COMPLETED and result_task.result_data and not automation.mock_mode:
         image_urls = result_task.result_data.get("image_urls", [])
         flow_task.output_assets = str(image_urls)
         flow_task.status = FlowBridgeTaskStatus.COMPLETED
-        flow_task.completed_at = datetime.utcnow()
+        flow_task.completed_at = datetime.now(timezone.utc)
         
         for i, url in enumerate(image_urls):
             asset = FlowBridgeAsset(
@@ -240,6 +275,7 @@ async def check_google_account_status(
     """Check Google account login status via automation."""
     project = await get_project_or_404(project_id, current_user.id, db)
     google_account = await get_google_account_or_404(check_data.google_account_id, current_user.id, db)
+    _require_real_automation(automation)
     
     parameters = {"session_data": google_account.encrypted_session_data}
     
@@ -255,10 +291,10 @@ async def check_google_account_status(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Automation failed: {str(e)}")
     
-    if result_task.status == AutomationStatus.COMPLETED and result_task.result_data:
+    if result_task.status == AutomationStatus.COMPLETED and result_task.result_data and not automation.mock_mode:
         is_logged_in = result_task.result_data.get("loggedIn", False)
         google_account.status = GoogleAccountStatus.CONNECTED if is_logged_in else GoogleAccountStatus.ERROR
-        google_account.last_used_at = datetime.utcnow()
+        google_account.last_used_at = datetime.now(timezone.utc)
         await db.commit()
     
     create_audit_log(
@@ -310,6 +346,7 @@ async def refresh_google_account_session(
     """Refresh Google account session via automation."""
     project = await get_project_or_404(project_id, current_user.id, db)
     google_account = await get_google_account_or_404(refresh_data.google_account_id, current_user.id, db)
+    _require_real_automation(automation)
     
     parameters = {"session_data": google_account.encrypted_session_data}
     
@@ -325,13 +362,13 @@ async def refresh_google_account_session(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Automation failed: {str(e)}")
     
-    if result_task.status == AutomationStatus.COMPLETED and result_task.result_data:
+    if result_task.status == AutomationStatus.COMPLETED and result_task.result_data and not automation.mock_mode:
         session_data = result_task.result_data
         if isinstance(session_data, dict):
             import json
             session_data = json.dumps(session_data)
         google_account.encrypted_session_data = session_data
-        google_account.last_used_at = datetime.utcnow()
+        google_account.last_used_at = datetime.now(timezone.utc)
         await db.commit()
     
     create_audit_log(

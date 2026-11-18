@@ -12,6 +12,11 @@ class UserCreate(UserBase):
     password: str = Field(..., min_length=8, max_length=128)
 
 
+class PasswordChange(BaseModel):
+    current_password: str = Field(..., min_length=1)
+    new_password: str = Field(..., min_length=8, max_length=128)
+
+
 class UserUpdate(BaseModel):
     full_name: Optional[str] = None
     email: Optional[EmailStr] = None

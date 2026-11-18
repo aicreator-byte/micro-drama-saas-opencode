@@ -1,7 +1,31 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List
 from datetime import datetime
 from app.models.episode import EpisodeStatus, SceneStatus, ShotStatus
+import ast
+import json
+
+
+def _parse_list_field(v):
+    """Accept a list, a JSON string, or a Python-repr string.
+
+    The DB stores these columns as TEXT via str(list)/json.dumps, while
+    the response schema declares List[str] — without this, any scene/shot
+    with characters set fails response validation on read (found while
+    testing scene-engine apply).
+    """
+    if v is None or isinstance(v, list):
+        return v
+    if isinstance(v, str):
+        try:
+            parsed = json.loads(v)
+        except (json.JSONDecodeError, TypeError):
+            try:
+                parsed = ast.literal_eval(v)
+            except (ValueError, SyntaxError):
+                return [v]
+        return parsed if isinstance(parsed, list) else [parsed]
+    return v
 
 
 # Episode schemas
@@ -50,6 +74,11 @@ class SceneBase(BaseModel):
     dialogue: Optional[str] = None  # JSON string
     characters_present: Optional[List[str]] = None
 
+    @field_validator('characters_present', mode='before')
+    @classmethod
+    def parse_characters_present(cls, v):
+        return _parse_list_field(v)
+
 
 class SceneCreate(SceneBase):
     pass
@@ -89,6 +118,11 @@ class ShotBase(BaseModel):
     duration: Optional[int] = Field(None, ge=0)
     description: Optional[str] = None
     characters_in_shot: Optional[List[str]] = None
+
+    @field_validator('characters_in_shot', mode='before')
+    @classmethod
+    def parse_characters_in_shot(cls, v):
+        return _parse_list_field(v)
 
 
 class ShotCreate(ShotBase):

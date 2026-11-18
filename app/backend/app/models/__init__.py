@@ -10,6 +10,9 @@ from app.models.flow_bridge import FlowBridgeTask, FlowBridgeAsset, FlowBridgeTa
 from app.models.story_engine import StoryEngineTask, StoryEngineTaskStatus, StoryEngineTaskType
 from app.models.scene_engine import SceneEngineTask, SceneEngineTaskStatus, SceneEngineTaskType
 from app.models.audit_log import AuditLog, AuditAction
+from app.models.settings import AppSettings
+from app.models.dialogue import Dialogue
+from app.models.episode_revision import EpisodeRevision
 
 __all__ = [
     "User",
@@ -41,4 +44,7 @@ __all__ = [
     "SceneEngineTaskType",
     "AuditLog",
     "AuditAction",
+    "AppSettings",
+    "Dialogue",
+    "EpisodeRevision",
 ]

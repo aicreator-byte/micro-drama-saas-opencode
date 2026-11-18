@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, Request, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from typing import List, Optional
+import json
 
 from app.core.database import get_db
 from app.api.v1.auth import get_current_user, create_audit_log
@@ -274,7 +275,7 @@ async def create_scene(
         duration_estimate=scene_data.duration_estimate,
         action=scene_data.action,
         dialogue=scene_data.dialogue,
-        characters_present=str(scene_data.characters_present) if scene_data.characters_present else None
+        characters_present=json.dumps(scene_data.characters_present) if scene_data.characters_present else None
     )
     db.add(scene)
     await db.commit()
@@ -401,7 +402,7 @@ async def update_scene(
     update_data = scene_data.model_dump(exclude_unset=True)
     for field, value in update_data.items():
         if field == "characters_present" and value is not None:
-            value = str(value)
+            value = json.dumps(value)
         setattr(scene, field, value)
     
     await db.commit()
@@ -509,7 +510,7 @@ async def create_shot(
         camera_movement=shot_data.camera_movement,
         duration=shot_data.duration,
         description=shot_data.description,
-        characters_in_shot=str(shot_data.characters_in_shot) if shot_data.characters_in_shot else None
+        characters_in_shot=json.dumps(shot_data.characters_in_shot) if shot_data.characters_in_shot else None
     )
     db.add(shot)
     await db.commit()
@@ -640,7 +641,7 @@ async def update_shot(
     update_data = shot_data.model_dump(exclude_unset=True)
     for field, value in update_data.items():
         if field == "characters_in_shot" and value is not None:
-            value = str(value)
+            value = json.dumps(value)
         setattr(shot, field, value)
     
     await db.commit()
@@ -706,3 +707,178 @@ async def delete_shot(
     
     await db.delete(shot)
     await db.commit()
+
+# ---------------------------------------------------------------------------
+# Dialogues & episode revisions (audit F-25: models existed with no API, so
+# generated dialogue could never be stored or read back as rows).
+# ---------------------------------------------------------------------------
+from app.models.dialogue import Dialogue
+from app.models.episode_revision import EpisodeRevision
+from app.schemas.dialogue import DialogueCreate, DialogueResponse
+from app.schemas.episode_revision import EpisodeRevisionCreate, EpisodeRevisionResponse
+
+
+async def _get_episode_or_404(episode_id: str, project_id: str, db: AsyncSession) -> Episode:
+    result = await db.execute(
+        select(Episode).where(Episode.id == episode_id, Episode.project_id == project_id)
+    )
+    episode = result.scalar_one_or_none()
+    if not episode:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Episode not found")
+    return episode
+
+
+async def _get_scene_or_404(scene_id: str, episode_id: str, db: AsyncSession) -> Scene:
+    result = await db.execute(
+        select(Scene).where(Scene.id == scene_id, Scene.episode_id == episode_id)
+    )
+    scene = result.scalar_one_or_none()
+    if not scene:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scene not found")
+    return scene
+
+
+@router.get("/{project_id}/episodes/{episode_id}/scenes/{scene_id}/dialogues", response_model=List[DialogueResponse])
+async def list_dialogues(
+    project_id: str,
+    episode_id: str,
+    scene_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    await get_project_or_404(project_id, current_user.id, db)
+    await _get_episode_or_404(episode_id, project_id, db)
+    await _get_scene_or_404(scene_id, episode_id, db)
+    result = await db.execute(
+        select(Dialogue).where(Dialogue.scene_id == scene_id).order_by(Dialogue.line_number)
+    )
+    return result.scalars().all()
+
+
+@router.post("/{project_id}/episodes/{episode_id}/scenes/{scene_id}/dialogues", response_model=DialogueResponse, status_code=status.HTTP_201_CREATED)
+async def create_dialogue(
+    project_id: str,
+    episode_id: str,
+    scene_id: str,
+    dialogue_data: DialogueCreate,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    await get_project_or_404(project_id, current_user.id, db)
+    await _get_episode_or_404(episode_id, project_id, db)
+    await _get_scene_or_404(scene_id, episode_id, db)
+    dialogue = Dialogue(
+        scene_id=scene_id,
+        character_id=dialogue_data.character_id,
+        line_number=dialogue_data.line_number,
+        character_name=dialogue_data.character_name,
+        dialogue_text=dialogue_data.dialogue_text,
+        parenthetical=dialogue_data.parenthetical,
+        action=dialogue_data.action,
+        beat_number=dialogue_data.beat_number,
+    )
+    db.add(dialogue)
+    await db.commit()
+    await db.refresh(dialogue)
+    create_audit_log(
+        db, current_user.id, AuditAction.DIALOGUE_CREATE,
+        resource_type="dialogue", resource_id=dialogue.id,
+        ip_address=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+        new_values={"character_name": dialogue.character_name, "line_number": dialogue.line_number}
+    )
+    await db.commit()
+    return dialogue
+
+
+@router.delete("/{project_id}/episodes/{episode_id}/scenes/{scene_id}/dialogues/{dialogue_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_dialogue(
+    project_id: str,
+    episode_id: str,
+    scene_id: str,
+    dialogue_id: str,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    await get_project_or_404(project_id, current_user.id, db)
+    await _get_episode_or_404(episode_id, project_id, db)
+    await _get_scene_or_404(scene_id, episode_id, db)
+    result = await db.execute(
+        select(Dialogue).where(Dialogue.id == dialogue_id, Dialogue.scene_id == scene_id)
+    )
+    dialogue = result.scalar_one_or_none()
+    if not dialogue:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dialogue not found")
+    create_audit_log(
+        db, current_user.id, AuditAction.DIALOGUE_DELETE,
+        resource_type="dialogue", resource_id=dialogue.id,
+        ip_address=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+        old_values={"character_name": dialogue.character_name, "line_number": dialogue.line_number}
+    )
+    await db.delete(dialogue)
+    await db.commit()
+
+
+@router.get("/{project_id}/episodes/{episode_id}/revisions", response_model=List[EpisodeRevisionResponse])
+async def list_episode_revisions(
+    project_id: str,
+    episode_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    await get_project_or_404(project_id, current_user.id, db)
+    await _get_episode_or_404(episode_id, project_id, db)
+    result = await db.execute(
+        select(EpisodeRevision).where(EpisodeRevision.episode_id == episode_id)
+        .order_by(EpisodeRevision.revision_number.desc())
+    )
+    return result.scalars().all()
+
+
+@router.post("/{project_id}/episodes/{episode_id}/revisions", response_model=EpisodeRevisionResponse, status_code=status.HTTP_201_CREATED)
+async def create_episode_revision(
+    project_id: str,
+    episode_id: str,
+    revision_data: EpisodeRevisionCreate,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Snapshot the episode's current title/summary/scenes as a revision."""
+    await get_project_or_404(project_id, current_user.id, db)
+    episode = await _get_episode_or_404(episode_id, project_id, db)
+    result = await db.execute(
+        select(Scene).where(Scene.episode_id == episode_id).order_by(Scene.scene_number)
+    )
+    scenes = result.scalars().all()
+    max_result = await db.execute(
+        select(func.max(EpisodeRevision.revision_number)).where(EpisodeRevision.episode_id == episode_id)
+    )
+    next_number = (max_result.scalar() or 0) + 1
+    revision = EpisodeRevision(
+        episode_id=episode_id,
+        revision_number=next_number,
+        title=episode.title,
+        summary=episode.summary,
+        scene_breakdown={"scenes": [
+            {"scene_number": s.scene_number, "title": s.title, "description": s.description}
+            for s in scenes
+        ]},
+        change_notes=revision_data.change_notes,
+        created_by=current_user.id,
+    )
+    db.add(revision)
+    await db.commit()
+    await db.refresh(revision)
+    create_audit_log(
+        db, current_user.id, AuditAction.EPISODE_REVISION_CREATE,
+        resource_type="episode_revision", resource_id=revision.id,
+        ip_address=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+        new_values={"episode_id": episode_id, "revision_number": next_number}
+    )
+    await db.commit()
+    return revision

@@ -168,3 +168,56 @@ class TestEpisodes:
         
         response = await client.get(f"/api/v1/projects/{test_project.id}/episodes/{ep_id}", headers=auth_headers2)
         assert response.status_code == 404
+
+class TestDialoguesAndRevisions:
+    """Audit F-25: Dialogue/EpisodeRevision models existed with no API."""
+
+    @pytest.mark.asyncio
+    async def test_dialogue_crud(
+        self, client: AsyncClient, auth_headers, test_project, test_episode,
+        test_scene
+    ):
+        create = await client.post(
+            f"/api/v1/projects/{test_project.id}/episodes/{test_episode.id}/scenes/{test_scene.id}/dialogues",
+            json={"line_number": 1, "character_name": "Nadia",
+                  "dialogue_text": "Aku tidak akan menyerah.",
+                  "parenthetical": "(tenang)", "beat_number": 1},
+            headers=auth_headers)
+        assert create.status_code == 201, create.text
+        dialogue_id = create.json()["id"]
+
+        rows = await client.get(
+            f"/api/v1/projects/{test_project.id}/episodes/{test_episode.id}/scenes/{test_scene.id}/dialogues",
+            headers=auth_headers)
+        assert rows.status_code == 200
+        assert len(rows.json()) == 1
+        assert rows.json()[0]["dialogue_text"] == "Aku tidak akan menyerah."
+
+        delete = await client.delete(
+            f"/api/v1/projects/{test_project.id}/episodes/{test_episode.id}/scenes/{test_scene.id}/dialogues/{dialogue_id}",
+            headers=auth_headers)
+        assert delete.status_code == 204
+
+    @pytest.mark.asyncio
+    async def test_episode_revision_snapshot(
+        self, client: AsyncClient, auth_headers, test_project, test_episode,
+        test_scene
+    ):
+        create = await client.post(
+            f"/api/v1/projects/{test_project.id}/episodes/{test_episode.id}/revisions",
+            json={"change_notes": "Snapshot before regenerate"},
+            headers=auth_headers)
+        assert create.status_code == 201, create.text
+        assert create.json()["revision_number"] == 1
+        assert create.json()["title"] == "The Return"
+        assert len(create.json()["scene_breakdown"]["scenes"]) == 1
+
+        second = await client.post(
+            f"/api/v1/projects/{test_project.id}/episodes/{test_episode.id}/revisions",
+            json={}, headers=auth_headers)
+        assert second.json()["revision_number"] == 2
+
+        rows = await client.get(
+            f"/api/v1/projects/{test_project.id}/episodes/{test_episode.id}/revisions",
+            headers=auth_headers)
+        assert len(rows.json()) == 2

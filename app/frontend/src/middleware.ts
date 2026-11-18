@@ -1,26 +1,16 @@
 import { NextResponse } from 'next/server';
 import type { NextRequest } from 'next/server';
 
-const publicPaths = ['/login', '/register'];
-const authPaths = ['/dashboard', '/projects'];
+// Auth is client-side in this app: the JWT lives in localStorage
+// (zustand persist 'auth-storage') and the API axios interceptor attaches
+// it; DashboardLayout + the 401 interceptor redirect to /login when it is
+// missing/invalid. The previous middleware read a cookie named
+// 'auth-storage' that is never set anywhere, so /dashboard and /projects
+// always redirected back to /login right after a successful login
+// (audit F-04). There is intentionally no server-side guard here — do not
+// re-add a cookie check without also setting that cookie at login.
 
 export function middleware(request: NextRequest) {
-  const { pathname } = request.nextUrl;
-  const authCookie = request.cookies.get('auth-storage');
-  
-  const isPublicPath = publicPaths.some(path => pathname.startsWith(path));
-  const isAuthPath = authPaths.some(path => pathname.startsWith(path));
-  
-  // If accessing auth path without auth, redirect to login
-  if (isAuthPath && !authCookie) {
-    return NextResponse.redirect(new URL('/login', request.url));
-  }
-  
-  // If accessing public path with auth, redirect to dashboard
-  if (isPublicPath && authCookie) {
-    return NextResponse.redirect(new URL('/dashboard', request.url));
-  }
-  
   return NextResponse.next();
 }
 

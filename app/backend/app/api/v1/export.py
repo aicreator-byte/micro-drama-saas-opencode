@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, Request, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from typing import List, Optional, Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import uuid
 import io
@@ -95,11 +95,52 @@ def format_export(data: Dict[str, Any], format: ExportFormat) -> tuple[bytes, st
         dict_to_md(data)
         content = "\n".join(md_lines).encode('utf-8')
         mime = "text/markdown"
-    else:  # CSV not fully implemented for complex nested data
+    elif format == ExportFormat.CSV:
+        # Real CSV (audit F-15/P1-08): previously JSON bytes with a JSON
+        # mime type. If the payload holds a top-level list of records
+        # (characters/locations/scenes/prompts/shots/episodes), emit one
+        # row per record; otherwise emit key,value rows for scalars.
+        import csv as _csv
+        buf = io.StringIO()
+        list_key, rows = None, None
+        for key in ("characters", "locations", "scenes", "shots", "prompts", "episodes"):
+            value = data.get(key)
+            if isinstance(value, list) and value and isinstance(value[0], dict):
+                list_key, rows = key, value
+                break
+        if rows is not None:
+            fieldnames: List[str] = []
+            for row in rows:
+                for k in row:
+                    if k not in fieldnames:
+                        fieldnames.append(k)
+            writer = _csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({k: _csv_cell(row.get(k)) for k in fieldnames})
+        else:
+            writer = _csv.writer(buf)
+            writer.writerow(["field", "value"])
+            for k, v in data.items():
+                if isinstance(v, (dict, list)):
+                    v = json.dumps(v, ensure_ascii=False)
+                writer.writerow([k, v])
+        content = buf.getvalue().encode('utf-8')
+        mime = "text/csv"
+    else:  # Fallback for any other format: JSON
         content = json.dumps(data, indent=2, ensure_ascii=False).encode('utf-8')
         mime = "application/json"
-    
+
     return content, mime
+
+
+def _csv_cell(value: Any) -> str:
+    """Flatten one CSV cell value to a plain string."""
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
 
 
 @router.post("/{project_id}/export", response_model=ExportResponse, status_code=status.HTTP_201_CREATED)
@@ -140,7 +181,7 @@ async def create_export(
                 locations=[serialize_model(l) for l in locations],
                 episodes=[serialize_model(e) for e in episodes],
                 prompts=[serialize_model(p) for p in prompts],
-                exported_at=datetime.utcnow()
+                exported_at=datetime.now(timezone.utc)
             ).model_dump()
             
         elif export_data.export_type == ExportType.EPISODE:
@@ -173,7 +214,7 @@ async def create_export(
                 scenes=[serialize_model(s) for s in scenes],
                 shots=[serialize_model(sh) for sh in shots],
                 prompts=[serialize_model(p) for p in prompts],
-                exported_at=datetime.utcnow()
+                exported_at=datetime.now(timezone.utc)
             ).model_dump()
             
         elif export_data.export_type == ExportType.PROMPTS:
@@ -182,7 +223,7 @@ async def create_export(
             
             data = PromptsExportData(
                 prompts=[serialize_model(p) for p in prompts],
-                exported_at=datetime.utcnow()
+                exported_at=datetime.now(timezone.utc)
             ).model_dump()
             
         elif export_data.export_type == ExportType.SERIES_BIBLE:
@@ -195,12 +236,12 @@ async def create_export(
         elif export_data.export_type == ExportType.CHARACTERS:
             char_result = await db.execute(select(Character).where(Character.project_id == project_id))
             characters = char_result.scalars().all()
-            data = {"characters": [serialize_model(c) for c in characters], "exported_at": datetime.utcnow().isoformat()}
+            data = {"characters": [serialize_model(c) for c in characters], "exported_at": datetime.now(timezone.utc).isoformat()}
             
         elif export_data.export_type == ExportType.LOCATIONS:
             loc_result = await db.execute(select(Location).where(Location.project_id == project_id))
             locations = loc_result.scalars().all()
-            data = {"locations": [serialize_model(l) for l in locations], "exported_at": datetime.utcnow().isoformat()}
+            data = {"locations": [serialize_model(l) for l in locations], "exported_at": datetime.now(timezone.utc).isoformat()}
             
         elif export_data.export_type == ExportType.SCENES:
             ep_result = await db.execute(select(Episode).where(Episode.project_id == project_id))
@@ -208,7 +249,7 @@ async def create_export(
             ep_ids = [e.id for e in episodes]
             scene_result = await db.execute(select(Scene).where(Scene.episode_id.in_(ep_ids)))
             scenes = scene_result.scalars().all()
-            data = {"scenes": [serialize_model(s) for s in scenes], "exported_at": datetime.utcnow().isoformat()}
+            data = {"scenes": [serialize_model(s) for s in scenes], "exported_at": datetime.now(timezone.utc).isoformat()}
             
         elif export_data.export_type == ExportType.FULL_PROJECT:
             # Export everything
@@ -244,7 +285,7 @@ async def create_export(
                 "scenes": [serialize_model(s) for s in scenes],
                 "shots": [serialize_model(sh) for sh in shots],
                 "prompts": [serialize_model(p) for p in prompts],
-                "exported_at": datetime.utcnow().isoformat()
+                "exported_at": datetime.now(timezone.utc).isoformat()
             }
         else:
             raise HTTPException(status_code=400, detail=f"Unknown export type: {export_data.export_type}")
@@ -268,8 +309,8 @@ async def create_export(
             status="completed",
             file_url=file_url,
             file_size=len(content),
-            created_at=datetime.utcnow(),
-            completed_at=datetime.utcnow()
+            created_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(timezone.utc)
         )
         
         # Safe audit action lookup
@@ -281,7 +322,7 @@ async def create_export(
             resource_type="export", resource_id=export_id,
             ip_address=request.client.host if request.client else None,
             user_agent=request.headers.get("user-agent"),
-            new_values={"export_type": export_data.export_type.value, "format": export_data.format.value, "size": len(content)}
+            new_values={"export_type": export_data.export_type.value, "format": export_data.format.value, "size": len(content), "episode_id": export_data.episode_id}
         )
         await db.commit()
         
@@ -320,7 +361,12 @@ async def list_exports(
             AuditLog.action.in_([
                 AuditAction.EXPORT_PROJECT,
                 AuditAction.EXPORT_EPISODE,
-                AuditAction.EXPORT_PROMPTS
+                AuditAction.EXPORT_PROMPTS,
+                AuditAction.EXPORT_SERIES_BIBLE,
+                AuditAction.EXPORT_CHARACTERS,
+                AuditAction.EXPORT_LOCATIONS,
+                AuditAction.EXPORT_SCENES,
+                AuditAction.EXPORT_FULL_PROJECT,
             ])
         ).order_by(AuditLog.created_at.desc()).limit(50)
     )
@@ -352,9 +398,13 @@ async def download_export(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Download a previously created export (regenerates if needed)."""
+    """Download a previously created export (regenerates deterministically
+    from the current DB rows, audit F-15 — previously a 307 stub)."""
+    from fastapi.responses import Response as FastAPIResponse
+    import base64
+
     project = await get_project_or_404(project_id, current_user.id, db)
-    
+
     # Check audit log for this export
     from app.models.audit_log import AuditLog
     result = await db.execute(
@@ -365,21 +415,33 @@ async def download_export(
         )
     )
     log = result.scalar_one_or_none()
-    
+
     if not log or not log.success:
         raise HTTPException(status_code=404, detail="Export not found or failed")
-    
-    # Recreate the export (in production, serve from storage)
+
+    # Regenerate the same export from live data and serve the bytes.
     new_vals = json.loads(log.new_values) if log.new_values else {}
     export_type = ExportType(new_vals.get("export_type", "project"))
     format = ExportFormat(new_vals.get("format", "json"))
-    
-    # For simplicity, redirect to the export endpoint with same params
-    # In production, serve from file storage
-    raise HTTPException(
-        status_code=307,
-        detail="Export download not fully implemented - use the export endpoint to regenerate",
-        headers={"Location": f"/api/v1/projects/{project_id}/export"}
+    export_req = ExportRequest(
+        export_type=export_type,
+        format=format,
+        project_id=project_id,
+        episode_id=new_vals.get("episode_id"),
+    )
+    regenerated = await create_export(project_id, export_req, request, current_user, db)
+    file_url = regenerated.file_url or ""
+    if ";base64," not in file_url:
+        raise HTTPException(status_code=500, detail="Regenerated export has no downloadable content")
+    mime_type, b64 = file_url.split(";base64,", 1)
+    mime_type = mime_type.replace("data:", "", 1) or "application/octet-stream"
+    content = base64.b64decode(b64)
+    ext = {"application/json": "json", "text/markdown": "md", "text/plain": "txt", "text/csv": "csv"}.get(mime_type, "bin")
+    filename = f"export-{export_id}.{ext}"
+    return FastAPIResponse(
+        content=content,
+        media_type=mime_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 
