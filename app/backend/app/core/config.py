@@ -46,7 +46,14 @@ class Settings(BaseSettings):
     FLOW_GENERATION_TIMEOUT_SECONDS: int = 600
     
     ENCRYPTION_KEY: str = secrets.token_urlsafe(32)
-    
+
+    # Fase 3 smoke live: ai_client baca NVIDIA_API_KEY via os.getenv;
+    # field harus dideklarasi agar Settings tidak menolaknya (extra_forbidden).
+    NVIDIA_API_KEY: str = ""
+    # Ada di .env root (untuk frontend/docker-compose); dideklarasi juga
+    # agar Settings tidak menolaknya (extra_forbidden).
+    NEXT_PUBLIC_API_URL: str = ""
+
     class Config:
         env_file = ".env"
         case_sensitive = True

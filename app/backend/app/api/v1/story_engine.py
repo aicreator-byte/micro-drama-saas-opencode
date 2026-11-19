@@ -688,6 +688,43 @@ async def delete_story_task(
     await db.commit()
 
 
+async def apply_outline_episodes(db: AsyncSession, project_id: str, episodes_data: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Create Episode rows (OUTLINED) from outline output.
+
+    Shared by the story-engine apply endpoint and auto-generate step 4.
+    Episode numbers that already exist are skipped, never overwritten or
+    duplicated. Entries without a usable episode_number are skipped.
+    """
+    existing_result = await db.execute(
+        select(Episode.episode_number).where(Episode.project_id == project_id)
+    )
+    existing_numbers = {row[0] for row in existing_result.all()}
+
+    created, skipped = [], []
+    for ep in episodes_data:
+        try:
+            number = int(ep.get("episode_number"))
+        except (TypeError, ValueError):
+            skipped.append({"episode": ep.get("title"), "reason": "missing episode_number"})
+            continue
+        if number in existing_numbers:
+            skipped.append({"episode_number": number, "reason": "already exists"})
+            continue
+        episode = Episode(
+            project_id=project_id,
+            episode_number=number,
+            title=(ep.get("title") or f"Episode {number}")[:255],
+            summary=ep.get("synopsis") or ep.get("logline"),
+            status=EpisodeStatus.OUTLINED,
+        )
+        db.add(episode)
+        existing_numbers.add(number)
+        created.append({"episode_number": number, "title": episode.title})
+
+    await db.commit()
+    return {"created_episodes": created, "skipped": skipped}
+
+
 @router.post("/{project_id}/story-engine/tasks/{task_id}/apply", response_model=Dict[str, Any])
 async def apply_story_task(
     project_id: str,
@@ -726,41 +763,15 @@ async def apply_story_task(
             detail=f"Task type {task.task_type.value} has no episode rows to apply"
         )
 
-    existing_result = await db.execute(
-        select(Episode.episode_number).where(Episode.project_id == project_id)
-    )
-    existing_numbers = {row[0] for row in existing_result.all()}
-
-    created, skipped = [], []
-    for ep in episodes_data:
-        try:
-            number = int(ep.get("episode_number"))
-        except (TypeError, ValueError):
-            skipped.append({"episode": ep.get("title"), "reason": "missing episode_number"})
-            continue
-        if number in existing_numbers:
-            skipped.append({"episode_number": number, "reason": "already exists"})
-            continue
-        episode = Episode(
-            project_id=project_id,
-            episode_number=number,
-            title=(ep.get("title") or f"Episode {number}")[:255],
-            summary=ep.get("synopsis") or ep.get("logline"),
-            status=EpisodeStatus.OUTLINED,
-        )
-        db.add(episode)
-        existing_numbers.add(number)
-        created.append({"episode_number": number, "title": episode.title})
-
-    await db.commit()
+    applied = await apply_outline_episodes(db, project_id, episodes_data)
 
     create_audit_log(
         db, current_user.id, AuditAction.STORY_ENGINE_TASK_UPDATE,
         resource_type="story_engine_task", resource_id=task.id,
         ip_address=request.client.host if request.client else None,
         user_agent=request.headers.get("user-agent"),
-        new_values={"applied_episodes": len(created), "skipped": len(skipped)}
+        new_values={"applied_episodes": len(applied["created_episodes"]), "skipped": len(applied["skipped"])}
     )
     await db.commit()
 
-    return {"created_episodes": created, "skipped": skipped}
+    return applied

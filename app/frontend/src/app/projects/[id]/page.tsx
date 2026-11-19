@@ -13,7 +13,7 @@ import {
   Image, Zap, Layers, Type, Palette,
   BookOpen, Target, Sparkles
 } from 'lucide-react';
-import { api, exportApi, flowBridgeApi, storyEngineApi, sceneEngineApi } from '@/lib/api';
+import { api, exportApi, flowBridgeApi, storyEngineApi, sceneEngineApi, autoGenerateApi } from '@/lib/api';
 import { useAuthStore } from '@/store';
 import { formatDate } from '@/lib/utils';
 
@@ -228,6 +228,28 @@ interface AuditLog {
   created_at: string;
 }
 
+interface AutoGenerateStep {
+  id: string;
+  job_id: string;
+  step: string;
+  step_order: number;
+  status: 'pending' | 'running' | 'completed' | 'failed';
+  error_message: string | null;
+  result?: Record<string, unknown> | null;
+}
+
+interface AutoGenerateJob {
+  id: string;
+  project_id: string;
+  title: string;
+  genre: string | null;
+  total_episodes: number;
+  premise: string | null;
+  status: 'pending' | 'running' | 'completed' | 'failed';
+  error_message: string | null;
+  steps: AutoGenerateStep[];
+}
+
 type Tab = 'overview' | 'series-bible' | 'characters' | 'locations' | 'episodes' | 'prompts' | 'google-accounts' | 'flow-bridge' | 'settings' | 'export' | 'audit-logs';
 
 const tabs: { id: Tab; label: string; icon: React.ReactNode }[] = [
@@ -258,6 +280,31 @@ export default function ProjectPage() {
   const [editDescription, setEditDescription] = useState('');
   const [editGenre, setEditGenre] = useState('');
   const [isSaving, setIsSaving] = useState(false);
+
+  // Auto-Generate (spec §6) — one job, 5 steps.
+  // NOTE: Fase 1 backend runs create + retry synchronously in the request,
+  // so there is no job id to poll while a run is in flight. The modal shows
+  // an indeterminate "generating" state during the request, then the final
+  // per-step status + Retry buttons. GET is used by Refresh for a past job.
+  const AUTO_GENERATE_STEP_LABELS: Record<string, string> = {
+    series_bible: 'Series Bible',
+    characters: 'Characters',
+    locations: 'Locations',
+    episodes: 'Episodes',
+    prompts: 'Prompts',
+  };
+  const AUTO_GENERATE_STEP_ORDER = ['series_bible', 'characters', 'locations', 'episodes', 'prompts'];
+  const [showAutoGenerateModal, setShowAutoGenerateModal] = useState(false);
+  const [autoGenForm, setAutoGenForm] = useState({
+    title: '',
+    genre: '',
+    total_episodes: '30',
+    premise: '',
+  });
+  const [autoGenJob, setAutoGenJob] = useState<AutoGenerateJob | null>(null);
+  const [autoGenSubmitting, setAutoGenSubmitting] = useState(false);
+  const [autoGenRetrying, setAutoGenRetrying] = useState<string | null>(null);
+  const [autoGenError, setAutoGenError] = useState('');
 
   // Series Bible
   const [seriesBible, setSeriesBible] = useState<SeriesBible | null>(null);
@@ -1120,6 +1167,88 @@ export default function ProjectPage() {
     } catch (err) {
       console.error('Failed to delete project:', err);
     }
+  };
+
+  // Auto-Generate (spec §6)
+  const openAutoGenerateModal = () => {
+    if (!autoGenJob) {
+      setAutoGenForm({
+        title: project?.title || '',
+        genre: project?.genre || '',
+        total_episodes: String(project?.total_episodes || 30),
+        premise: '',
+      });
+    }
+    setAutoGenError('');
+    setShowAutoGenerateModal(true);
+  };
+
+  // Plain function (not useCallback): only called from event handlers,
+  // no memoization needed — avoids exhaustive-deps churn on fetchProject.
+  const refreshAutoGenData = () => {
+    fetchProject();
+    fetchSeriesBible();
+    fetchCharacters();
+    fetchLocations();
+    fetchEpisodes();
+    fetchPrompts();
+  };
+
+  const handleAutoGenerateSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!autoGenForm.title.trim()) return;
+    setAutoGenSubmitting(true);
+    setAutoGenError('');
+    setAutoGenJob(null);
+    try {
+      const response = await autoGenerateApi.create(projectId, {
+        title: autoGenForm.title.trim(),
+        genre: autoGenForm.genre.trim() || undefined,
+        total_episodes: Math.min(60, Math.max(1, parseInt(autoGenForm.total_episodes, 10) || 30)),
+        premise: autoGenForm.premise.trim() || undefined,
+      });
+      setAutoGenJob(response.data);
+      if (response.data.status === 'completed') refreshAutoGenData();
+    } catch (err: any) {
+      const detail = err.response?.data?.detail;
+      setAutoGenError(typeof detail === 'string' ? detail : 'Failed to start auto-generate.');
+      console.error('Failed to start auto-generate:', err);
+    } finally {
+      setAutoGenSubmitting(false);
+    }
+  };
+
+  const handleAutoGenRetry = async (step: string) => {
+    if (!autoGenJob) return;
+    setAutoGenRetrying(step);
+    setAutoGenError('');
+    try {
+      const response = await autoGenerateApi.retry(projectId, autoGenJob.id, step);
+      setAutoGenJob(response.data);
+      if (response.data.status === 'completed') refreshAutoGenData();
+    } catch (err: any) {
+      const detail = err.response?.data?.detail;
+      setAutoGenError(typeof detail === 'string' ? detail : `Failed to retry step ${step}.`);
+      console.error('Failed to retry auto-generate step:', err);
+    } finally {
+      setAutoGenRetrying(null);
+    }
+  };
+
+  const handleAutoGenRefresh = async () => {
+    if (!autoGenJob) return;
+    try {
+      const response = await autoGenerateApi.get(projectId, autoGenJob.id);
+      setAutoGenJob(response.data);
+      if (response.data.status === 'completed') refreshAutoGenData();
+    } catch (err) {
+      console.error('Failed to refresh auto-generate job:', err);
+    }
+  };
+
+  const openAutoGenResults = (tab: Tab) => {
+    setShowAutoGenerateModal(false);
+    setActiveTab(tab);
   };
 
   if (!isAuthenticated || isLoading) {
@@ -2295,6 +2424,12 @@ export default function ProjectPage() {
                 </span>
               </div>
             </div>
+            <div className="flex items-center gap-2">
+              <button onClick={openAutoGenerateModal} className="btn-primary" title="Generate the whole project with AI: bible, characters, locations, episodes and prompts">
+                <Sparkles className="w-4 h-4 mr-2" />
+                Auto-Generate
+              </button>
+            </div>
           </div>
           
           <div className="border-t border-slate-200 dark:border-slate-700">
@@ -2321,6 +2456,209 @@ export default function ProjectPage() {
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
         {renderTabContent()}
       </main>
+
+      {/* Auto-Generate modal (spec §6) */}
+      {showAutoGenerateModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50">
+          <div className="bg-white dark:bg-slate-800 rounded-xl shadow-xl max-w-lg w-full max-h-[90vh] overflow-y-auto">
+            <div className="p-6 border-b border-slate-200 dark:border-slate-700 flex items-center justify-between">
+              <h2 className="text-xl font-semibold text-slate-900 dark:text-white flex items-center gap-2">
+                <Sparkles className="w-5 h-5 text-primary-600" />
+                Auto-Generate
+              </h2>
+              <button onClick={() => setShowAutoGenerateModal(false)} className="btn-ghost p-2" title="Close">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-6 space-y-4">
+              {!autoGenJob && !autoGenSubmitting && (
+                <form onSubmit={handleAutoGenerateSubmit} className="space-y-4">
+                  <p className="text-sm text-slate-500 dark:text-slate-400">
+                    AI fills the whole project for you: Series Bible, Characters, Locations,
+                    Episodes and Prompts — in order, one job. Just give it a title.
+                  </p>
+                  <div>
+                    <label htmlFor="autogen-title" className="label">Title *</label>
+                    <input
+                      id="autogen-title"
+                      type="text"
+                      value={autoGenForm.title}
+                      onChange={(e) => setAutoGenForm({ ...autoGenForm, title: e.target.value })}
+                      className="input"
+                      placeholder="THE BILLIONAIRE CEO"
+                      required
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="autogen-genre" className="label">Genre</label>
+                    <input
+                      id="autogen-genre"
+                      type="text"
+                      value={autoGenForm.genre}
+                      onChange={(e) => setAutoGenForm({ ...autoGenForm, genre: e.target.value })}
+                      className="input"
+                      placeholder="Romance, Drama, Revenge…"
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="autogen-episodes" className="label">Total episodes</label>
+                    <input
+                      id="autogen-episodes"
+                      type="number"
+                      min={1}
+                      max={60}
+                      value={autoGenForm.total_episodes}
+                      onChange={(e) => setAutoGenForm({ ...autoGenForm, total_episodes: e.target.value })}
+                      className="input"
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="autogen-premise" className="label">Premise (optional)</label>
+                    <textarea
+                      id="autogen-premise"
+                      value={autoGenForm.premise}
+                      onChange={(e) => setAutoGenForm({ ...autoGenForm, premise: e.target.value })}
+                      className="input"
+                      rows={3}
+                      placeholder="One or two sentences about the story…"
+                    />
+                  </div>
+                  {autoGenError && (
+                    <p className="text-sm text-red-600 flex items-start gap-2">
+                      <AlertCircle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                      {autoGenError}
+                    </p>
+                  )}
+                  <div className="flex justify-end gap-3">
+                    <button type="button" onClick={() => setShowAutoGenerateModal(false)} className="btn-secondary">Cancel</button>
+                    <button type="submit" className="btn-primary" disabled={!autoGenForm.title.trim()}>
+                      <Sparkles className="w-4 h-4 mr-2" />
+                      Start Auto-Generate
+                    </button>
+                  </div>
+                </form>
+              )}
+
+              {autoGenSubmitting && (
+                <div className="space-y-4">
+                  <div className="flex items-center gap-3 text-slate-900 dark:text-white">
+                    <Loader2 className="w-5 h-5 animate-spin text-primary-600" />
+                    <p className="font-medium">Generating all 5 steps — this can take a few minutes.</p>
+                  </div>
+                  <p className="text-sm text-slate-500 dark:text-slate-400">
+                    The AI is writing the bible, characters, locations, episodes and prompts.
+                    Please keep this tab open.
+                  </p>
+                  <ul className="space-y-2">
+                    {AUTO_GENERATE_STEP_ORDER.map((step) => (
+                      <li key={step} className="flex items-center gap-3 text-sm text-slate-500 dark:text-slate-400">
+                        <Clock className="w-4 h-4" />
+                        {AUTO_GENERATE_STEP_LABELS[step]}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {autoGenJob && !autoGenSubmitting && (
+                <div className="space-y-4">
+                  <div className="flex items-center justify-between">
+                    <p className="text-sm text-slate-500 dark:text-slate-400">
+                      Job: <span className="font-medium text-slate-900 dark:text-white">{autoGenJob.title}</span>
+                      {' '}· {autoGenJob.total_episodes} episodes
+                    </p>
+                    <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${
+                      autoGenJob.status === 'completed' ? 'bg-green-100 text-green-800' :
+                      autoGenJob.status === 'failed' ? 'bg-red-100 text-red-800' :
+                      'bg-blue-100 text-blue-800'
+                    }`}>{autoGenJob.status}</span>
+                  </div>
+
+                  {autoGenError && (
+                    <p className="text-sm text-red-600 flex items-start gap-2">
+                      <AlertCircle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                      {autoGenError}
+                    </p>
+                  )}
+                  {autoGenJob.error_message && (
+                    <p className="text-sm text-red-600">{autoGenJob.error_message}</p>
+                  )}
+
+                  <ul className="space-y-2">
+                    {[...autoGenJob.steps].sort((a, b) => a.step_order - b.step_order).map((step) => (
+                      <li key={step.id} className="border border-slate-200 dark:border-slate-700 rounded-lg p-3">
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="flex items-center gap-3 text-sm">
+                            {step.status === 'completed' && <CheckCircle className="w-4 h-4 text-green-600" />}
+                            {step.status === 'failed' && <XCircle className="w-4 h-4 text-red-600" />}
+                            {step.status === 'running' && <Loader2 className="w-4 h-4 animate-spin text-blue-600" />}
+                            {step.status === 'pending' && <Clock className="w-4 h-4 text-slate-400" />}
+                            <span className="font-medium text-slate-900 dark:text-white">
+                              {AUTO_GENERATE_STEP_LABELS[step.step] || step.step}
+                            </span>
+                            <span className="text-slate-500 dark:text-slate-400 capitalize">{step.status}</span>
+                          </div>
+                          {step.status === 'failed' && (
+                            <button
+                              onClick={() => handleAutoGenRetry(step.step)}
+                              disabled={autoGenRetrying !== null}
+                              className="btn-secondary text-xs"
+                            >
+                              {autoGenRetrying === step.step
+                                ? <Loader2 className="w-3 h-3 animate-spin mr-1" />
+                                : <RefreshCw className="w-3 h-3 mr-1" />}
+                              Retry
+                            </button>
+                          )}
+                        </div>
+                        {step.status === 'failed' && step.error_message && (
+                          <p className="text-xs text-red-600 mt-2">{step.error_message}</p>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+
+                  {autoGenJob.status === 'completed' && (
+                    <div className="bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-lg p-4">
+                      <p className="text-sm font-medium text-green-800 dark:text-green-300 mb-3">
+                        Done — everything is filled in. Open a tab to see the results:
+                      </p>
+                      <div className="flex flex-wrap gap-2">
+                        <button onClick={() => openAutoGenResults('series-bible')} className="btn-secondary text-xs">Series Bible</button>
+                        <button onClick={() => openAutoGenResults('characters')} className="btn-secondary text-xs">Characters</button>
+                        <button onClick={() => openAutoGenResults('locations')} className="btn-secondary text-xs">Locations</button>
+                        <button onClick={() => openAutoGenResults('episodes')} className="btn-secondary text-xs">Episodes</button>
+                        <button onClick={() => openAutoGenResults('prompts')} className="btn-secondary text-xs">Prompts</button>
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="flex justify-between gap-3 pt-2">
+                    <button
+                      onClick={handleAutoGenRefresh}
+                      className="btn-ghost text-sm"
+                      title="Re-fetch the latest job status from the server"
+                    >
+                      <RefreshCw className="w-4 h-4 mr-2" />
+                      Refresh status
+                    </button>
+                    <div className="flex gap-3">
+                      <button
+                        onClick={() => { setAutoGenJob(null); setAutoGenError(''); }}
+                        className="btn-secondary"
+                      >
+                        Start a new job
+                      </button>
+                      <button onClick={() => setShowAutoGenerateModal(false)} className="btn-primary">Close</button>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

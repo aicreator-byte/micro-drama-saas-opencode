@@ -8,6 +8,7 @@ import logging
 import json
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +58,9 @@ class AIClient:
         errors = []
 
         for provider in self.providers:
-            api_key = os.getenv(provider.key_env)
+            # .env tidak masuk os.environ — fallback ke Settings (.env).
+            api_key = os.getenv(provider.key_env) or getattr(
+                settings, provider.key_env, None)
             if not api_key and provider.provider != "mock":
                 errors.append({
                     "provider_id": provider.id,
@@ -231,6 +234,53 @@ class AIClient:
                     for i in range(1, 6)
                 ],
                 "generated_at": "2024-01-01T00:00:00"
+            })
+        # Auto-Generate prompts (checked before story-engine branches:
+        # the bible prompt mentions episodes, the cast prompt mentions
+        # characters, and the video-prompt prompt mentions episodes).
+        elif "create a complete series bible" in lower_content:
+            content = json.dumps({
+                "premise": "Mock premise for the series",
+                "main_plot": "Mock main plot",
+                "subplots": ["Mock subplot 1: description", "Mock subplot 2: description"],
+                "character_relationships": "Mock character relationships",
+                "world_settings": "Mock world settings",
+                "tone_and_visual_style": "Mock tone",
+                "ending_direction": "Mock ending",
+                "episode_structure": "Mock episode structure",
+            })
+        elif "create the main cast" in lower_content:
+            content = json.dumps({
+                "characters": [
+                    {
+                        "name": f"Mock Character {i}",
+                        "role": "protagonist" if i == 1 else ("antagonist" if i == 2 else "supporting"),
+                        "age": str(20 + i),
+                        "gender": "female" if i % 2 else "male",
+                        "ethnicity": "Mock ethnicity",
+                        "background": f"Background for mock character {i}",
+                        "motivations": f"Motivation {i}",
+                        "fears": f"Fear {i}",
+                        "personality_traits": ["brave", "stubborn", "kind"],
+                    }
+                    for i in range(1, 6)
+                ]
+            })
+        elif "write one video generation prompt for each episode" in lower_content:
+            import re as _re2
+            _nums = sorted({int(n) for n in _re2.findall(r"episode (\d+):", user_content)})
+            if not _nums:
+                _nums = [1, 2, 3, 4, 5]
+            content = json.dumps({
+                "prompts": [
+                    {
+                        "episode_number": n,
+                        "title": f"Video prompt for episode {n}",
+                        "prompt_text": f"Cinematic vertical micro-drama scene for episode {n}, same cast and look throughout.",
+                        "negative_prompt": "blurry, low quality, distorted faces",
+                    }
+                    for n in _nums
+                ]
             })
         # Story Engine prompts
         elif "detailed outline for one episode" in lower_content:

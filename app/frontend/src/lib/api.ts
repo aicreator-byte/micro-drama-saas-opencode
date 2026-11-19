@@ -309,6 +309,20 @@ export const storyEngineApi = {
     api.delete(`/projects/${projectId}/story-engine/tasks/${taskId}`),
 };
 
+// Auto-Generate API (Fase 1: one job, 5 steps; create + retry run
+// synchronously in the request and return the final job — there is no
+// background execution, so the job id is only known after POST returns).
+export const autoGenerateApi = {
+  create: (projectId: string, data: { title: string; genre?: string; total_episodes?: number; premise?: string }) =>
+    api.post(`/projects/${projectId}/auto-generate`, data),
+
+  get: (projectId: string, jobId: string) =>
+    api.get(`/projects/${projectId}/auto-generate/${jobId}`),
+
+  retry: (projectId: string, jobId: string, step: string) =>
+    api.post(`/projects/${projectId}/auto-generate/${jobId}/retry/${step}`),
+};
+
 // Scene Engine API
 export const sceneEngineApi = {
   list: (projectId: string) =>

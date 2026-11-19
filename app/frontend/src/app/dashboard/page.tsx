@@ -34,7 +34,13 @@ export default function DashboardPage() {
         const allProjects: Project[] = projectsResponse.data.projects;
         
         // Calculate stats
-        const activeProjects = allProjects.filter(p => p.status === ProjectStatus.IN_PROGRESS).length;
+        // "Active" = work still in progress: DRAFT + IN_PROGRESS.
+        // COMPLETED / ARCHIVED projects are not active. This is the one
+        // definition used everywhere (spec §7): a project that only exists
+        // as a draft (e.g. THE BILLIONAIRE CEO) counts as active work.
+        const activeProjects = allProjects.filter(
+          p => p.status === ProjectStatus.DRAFT || p.status === ProjectStatus.IN_PROGRESS
+        ).length;
         
         // Load data for current project if exists
         let totalCharacters = 0;

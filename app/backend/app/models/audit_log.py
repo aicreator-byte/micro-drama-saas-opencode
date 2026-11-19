@@ -109,6 +109,13 @@ class AuditAction(str, enum.Enum):
     SCENE_ENGINE_TASK_EXECUTE = "scene_engine_task_execute"
     SCENE_ENGINE_TASK_DELETE = "scene_engine_task_delete"
 
+    # Auto Generate (one job runs the 5 steps: bible -> characters ->
+    # locations -> episodes -> prompts). Values are <= 25 chars: the live
+    # SQLite audit_logs.action column is VARCHAR(25) with no CHECK.
+    AUTO_GENERATE_CREATE = "auto_generate_create"
+    AUTO_GENERATE_RUN = "auto_generate_run"
+    AUTO_GENERATE_RETRY = "auto_generate_retry"
+
 
 class AuditLog(Base):
     __tablename__ = "audit_logs"
