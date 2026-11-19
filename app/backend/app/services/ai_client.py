@@ -240,6 +240,7 @@ class AIClient:
         # characters, and the video-prompt prompt mentions episodes).
         elif "create a complete series bible" in lower_content:
             content = json.dumps({
+                "genre": "Romance",
                 "premise": "Mock premise for the series",
                 "main_plot": "Mock main plot",
                 "subplots": ["Mock subplot 1: description", "Mock subplot 2: description"],
@@ -268,7 +269,11 @@ class AIClient:
             })
         elif "write one video generation prompt for each episode" in lower_content:
             import re as _re2
-            _nums = sorted({int(n) for n in _re2.findall(r"episode (\d+):", user_content)})
+            # The prompt lists episodes as "- Episode 6: ..." (capital E),
+            # so match against the lowercased text — otherwise the numbers
+            # are never found and the mock falls back to episodes 1-5,
+            # which breaks chunked prompt generation for >5 episodes.
+            _nums = sorted({int(n) for n in _re2.findall(r"episode (\d+):", lower_content)})
             if not _nums:
                 _nums = [1, 2, 3, 4, 5]
             content = json.dumps({
@@ -319,7 +324,11 @@ class AIClient:
         elif "world building" in lower_content:
             content = json.dumps({
                 "series_bible_id": "test-series-bible",
-                "locations": [{"name": "Location 1", "type": "urban", "description": "Description"}],
+                "locations": [
+                    {"name": "Location 1", "type": "urban", "description": "Description"},
+                    {"name": "Location 2", "type": "rural", "description": "Description"},
+                    {"name": "Location 3", "type": "office", "description": "Description"},
+                ],
                 "factions": [{"name": "Faction 1", "type": "government", "description": "Description"}],
                 "technology": [{"name": "Tech 1", "description": "Description"}],
                 "culture": [{"name": "Culture 1", "description": "Description"}],

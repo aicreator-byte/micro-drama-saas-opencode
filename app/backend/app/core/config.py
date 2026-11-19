@@ -1,6 +1,19 @@
 from pydantic_settings import BaseSettings
 from typing import Optional
+from pathlib import Path
+import logging
 import secrets
+
+logger = logging.getLogger(__name__)
+
+# .env is resolved from the CODE location, never from the process CWD
+# (audit SH-1: running the server from the wrong directory silently lost
+# the key, because Settings only read "./.env"). The leg root (opencode/)
+# holds .env; app/backend/ may hold one too. pydantic-settings reads the
+# list in order and later files win: backend/.env > leg-root/.env > CWD.
+_BACKEND_DIR = Path(__file__).resolve().parents[2]  # app/backend
+_LEG_ROOT = _BACKEND_DIR.parent.parent  # opencode/
+_ENV_FILES = (".env", str(_LEG_ROOT / ".env"), str(_BACKEND_DIR / ".env"))
 
 
 class Settings(BaseSettings):
@@ -55,8 +68,33 @@ class Settings(BaseSettings):
     NEXT_PUBLIC_API_URL: str = ""
 
     class Config:
-        env_file = ".env"
+        env_file = _ENV_FILES
         case_sensitive = True
 
 
 settings = Settings()
+
+
+def _ensure_usable_database_url() -> None:
+    """Guard: the leg .env ships a postgresql+asyncpg DATABASE_URL, but
+    this venv has no asyncpg driver and no Postgres server — creating the
+    engine would crash at import. If the configured driver is unavailable,
+    fall back to the local sqlite file under the leg root (loud warning,
+    not silent). An explicitly exported DATABASE_URL (start script, tests)
+    is honoured as-is."""
+    url = settings.DATABASE_URL
+    scheme = url.split("://", 1)[0].lower()
+    if scheme in ("postgresql+asyncpg", "postgresql", "postgres"):
+        try:
+            import asyncpg  # noqa: F401
+        except ImportError:
+            fallback = f"sqlite+aiosqlite:///{_LEG_ROOT / 'micro_drama.db'}"
+            logger.warning(
+                "DATABASE_URL from .env uses %s but asyncpg is not installed; "
+                "falling back to %s",
+                scheme, fallback,
+            )
+            settings.DATABASE_URL = fallback
+
+
+_ensure_usable_database_url()

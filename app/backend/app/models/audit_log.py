@@ -57,10 +57,14 @@ class AuditAction(str, enum.Enum):
 
     # Dialogue
     DIALOGUE_CREATE = "dialogue_create"
+    DIALOGUE_READ = "dialogue_read"
+    DIALOGUE_UPDATE = "dialogue_update"
     DIALOGUE_DELETE = "dialogue_delete"
 
     # Episode revision
     EPISODE_REVISION_CREATE = "episode_revision_create"
+    EPISODE_REVISION_READ = "episode_revision_read"
+    EPISODE_REVISION_DELETE = "episode_revision_delete"
     
     # Prompt
     PROMPT_CREATE = "prompt_create"

@@ -13,6 +13,16 @@ class DialogueCreate(BaseModel):
     beat_number: Optional[int] = None
 
 
+class DialogueUpdate(BaseModel):
+    character_id: Optional[str] = None
+    line_number: Optional[int] = Field(default=None, ge=1)
+    character_name: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    dialogue_text: Optional[str] = Field(default=None, min_length=1)
+    parenthetical: Optional[str] = None
+    action: Optional[str] = None
+    beat_number: Optional[int] = None
+
+
 class DialogueResponse(BaseModel):
     id: str
     scene_id: str

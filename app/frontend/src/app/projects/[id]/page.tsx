@@ -123,13 +123,12 @@ interface Scene {
 interface Prompt {
   id: string;
   project_id: string;
-  name: string;
-  category: string | null;
-  template: string;
-  variables: string | null;
-  description: string | null;
+  prompt_type: string;
+  title: string | null;
+  prompt_text: string;
+  negative_prompt: string | null;
+  status: string;
   version: number;
-  is_active: boolean;
   times_used: number;
   created_at: string;
   updated_at: string;
@@ -282,10 +281,10 @@ export default function ProjectPage() {
   const [isSaving, setIsSaving] = useState(false);
 
   // Auto-Generate (spec §6) — one job, 5 steps.
-  // NOTE: Fase 1 backend runs create + retry synchronously in the request,
-  // so there is no job id to poll while a run is in flight. The modal shows
-  // an indeterminate "generating" state during the request, then the final
-  // per-step status + Retry buttons. GET is used by Refresh for a past job.
+  // The backend runs jobs ASYNC: POST creates the job and returns 201 with
+  // status RUNNING; the steps run in a background task. While the modal is
+  // open and the job is still running, the page polls GET every 2s for the
+  // live per-step status, and refreshes the tab data when the job completes.
   const AUTO_GENERATE_STEP_LABELS: Record<string, string> = {
     series_bible: 'Series Bible',
     characters: 'Characters',
@@ -423,12 +422,10 @@ export default function ProjectPage() {
   const [showPromptModal, setShowPromptModal] = useState(false);
   const [editingPrompt, setEditingPrompt] = useState<Prompt | null>(null);
   const [promptForm, setPromptForm] = useState<Partial<Prompt>>({
-    name: '',
-    category: 'scene',
-    template: '',
-    variables: '',
-    description: '',
-    is_active: true,
+    prompt_type: 'video_generation',
+    title: '',
+    prompt_text: '',
+    negative_prompt: '',
   });
   const [promptSaving, setPromptSaving] = useState(false);
   const [promptSearch, setPromptSearch] = useState('');
@@ -877,7 +874,7 @@ export default function ProjectPage() {
       const response = await api.post(`/projects/${projectId}/prompts`, promptForm);
       setPrompts(prev => [response.data, ...prev]);
       setShowPromptModal(false);
-      setPromptForm({ name: '', category: 'scene', template: '', variables: '', description: '', is_active: true });
+      setPromptForm({ prompt_type: 'video_generation', title: '', prompt_text: '', negative_prompt: '' });
       setEditingPrompt(null);
     } catch (err) {
       console.error('Failed to create prompt:', err);
@@ -914,7 +911,12 @@ export default function ProjectPage() {
 
   const openEditPrompt = (prompt: Prompt) => {
     setEditingPrompt(prompt);
-    setPromptForm(prompt);
+    setPromptForm({
+      prompt_type: prompt.prompt_type,
+      title: prompt.title || '',
+      prompt_text: prompt.prompt_text,
+      negative_prompt: prompt.negative_prompt || '',
+    });
     setShowPromptModal(true);
   };
 
@@ -1251,6 +1253,24 @@ export default function ProjectPage() {
     setActiveTab(tab);
   };
 
+  // Live progress: poll the running job every 2s while the modal is open.
+  // Stops by itself once the job is completed/failed; on completion the
+  // tab data is refreshed so the new rows show up without a manual reload.
+  useEffect(() => {
+    if (!showAutoGenerateModal || !autoGenJob) return;
+    if (autoGenJob.status === 'completed' || autoGenJob.status === 'failed') return;
+    const timer = setInterval(async () => {
+      try {
+        const response = await autoGenerateApi.get(projectId, autoGenJob.id);
+        setAutoGenJob(response.data);
+        if (response.data.status === 'completed') refreshAutoGenData();
+      } catch (err) {
+        console.error('Failed to poll auto-generate job:', err);
+      }
+    }, 2000);
+    return () => clearInterval(timer);
+  }, [showAutoGenerateModal, autoGenJob, projectId]);
+
   if (!isAuthenticated || isLoading) {
     return (
       <div className="min-h-screen bg-slate-50 dark:bg-slate-900 flex items-center justify-center">
@@ -1333,7 +1353,28 @@ export default function ProjectPage() {
             ) : (
               <>
                 <div className="card">
-                  <h3 className="text-lg font-semibold text-slate-900 dark:text-white mb-4">Series Bible Overview</h3>
+                  <div className="flex items-center justify-between mb-4">
+                    <h3 className="text-lg font-semibold text-slate-900 dark:text-white">Series Bible Overview</h3>
+                    <button
+                      onClick={() => {
+                        setSeriesBibleForm({
+                          premise: seriesBible.premise || '',
+                          main_plot: seriesBible.main_plot || '',
+                          subplots: Array.isArray(seriesBible.subplots) ? seriesBible.subplots.join('\n') : (seriesBible.subplots || ''),
+                          character_relationships: seriesBible.character_relationships || '',
+                          world_settings: seriesBible.world_settings || '',
+                          tone_and_visual_style: seriesBible.tone_and_visual_style || '',
+                          ending_direction: seriesBible.ending_direction || '',
+                          episode_structure: seriesBible.episode_structure || '',
+                        });
+                        setShowSeriesBibleModal(true);
+                      }}
+                      className="btn-secondary"
+                    >
+                      <Edit className="w-4 h-4 mr-2" />
+                      Edit Series Bible
+                    </button>
+                  </div>
                   <div className="space-y-4">
                     {seriesBible.premise && (
                       <div>
@@ -1824,7 +1865,7 @@ export default function ProjectPage() {
               <h2 className="text-lg font-semibold text-slate-900 dark:text-white">Prompt Studio</h2>
               <div className="flex items-center gap-2">
                 <select value={promptCategoryFilter} onChange={(e) => setPromptCategoryFilter(e.target.value)} className="input w-auto">
-                  <option value="all">All Categories</option>
+                  <option value="all">All Types</option>
                   <option value="character_image">Character Image</option>
                   <option value="location_image">Location Image</option>
                   <option value="scene_image">Scene Image</option>
@@ -1843,7 +1884,7 @@ export default function ProjectPage() {
                   className="input w-64"
                 />
                 <button 
-                  onClick={() => { setEditingPrompt(null); setPromptForm({ name: '', category: 'scene', template: '', variables: '', description: '', is_active: true }); setShowPromptModal(true); }}
+                  onClick={() => { setEditingPrompt(null); setPromptForm({ prompt_type: 'video_generation', title: '', prompt_text: '', negative_prompt: '' }); setShowPromptModal(true); }}
                   className="btn-primary"
                 >
                   <Plus className="w-4 h-4 mr-2" />
@@ -1859,9 +1900,9 @@ export default function ProjectPage() {
                 <div className="text-center py-12">
                   <Type className="w-12 h-12 text-slate-300 dark:text-slate-600 mx-auto mb-4" />
                   <h3 className="text-lg font-medium text-slate-900 dark:text-white mb-2">No prompts yet</h3>
-                  <p className="text-slate-500 dark:text-slate-400 mb-6">Create reusable prompt templates</p>
+                  <p className="text-slate-500 dark:text-slate-400 mb-6">Create video and image generation prompts</p>
                   <button 
-                    onClick={() => { setEditingPrompt(null); setPromptForm({ name: '', category: 'scene', template: '', variables: '', description: '', is_active: true }); setShowPromptModal(true); }}
+                    onClick={() => { setEditingPrompt(null); setPromptForm({ prompt_type: 'video_generation', title: '', prompt_text: '', negative_prompt: '' }); setShowPromptModal(true); }}
                     className="btn-primary"
                   >
                     <Plus className="w-4 h-4 mr-2" />
@@ -1875,8 +1916,8 @@ export default function ProjectPage() {
                   <table className="w-full">
                     <thead>
                       <tr className="border-b border-slate-200 dark:border-slate-700">
-                        <th className="text-left py-3 px-4 text-sm font-medium text-slate-500 dark:text-slate-400">Name</th>
-                        <th className="text-left py-3 px-4 text-sm font-medium text-slate-500 dark:text-slate-400">Category</th>
+                        <th className="text-left py-3 px-4 text-sm font-medium text-slate-500 dark:text-slate-400">Title</th>
+                        <th className="text-left py-3 px-4 text-sm font-medium text-slate-500 dark:text-slate-400">Type</th>
                         <th className="text-left py-3 px-4 text-sm font-medium text-slate-500 dark:text-slate-400">Status</th>
                         <th className="text-left py-3 px-4 text-sm font-medium text-slate-500 dark:text-slate-400">Version</th>
                         <th className="text-left py-3 px-4 text-sm font-medium text-slate-500 dark:text-slate-400">Used</th>
@@ -1885,22 +1926,26 @@ export default function ProjectPage() {
                     </thead>
                     <tbody>
                       {prompts
-                        .filter(p => 
-                          (promptCategoryFilter === 'all' || p.category === promptCategoryFilter) &&
-                          (promptSearch === '' || p.name.toLowerCase().includes(promptSearch.toLowerCase()))
+                        .filter(p =>
+                          (promptCategoryFilter === 'all' || p.prompt_type === promptCategoryFilter) &&
+                          (promptSearch === '' ||
+                            (p.title || '').toLowerCase().includes(promptSearch.toLowerCase()) ||
+                            p.prompt_text.toLowerCase().includes(promptSearch.toLowerCase()))
                         )
                         .map((prompt) => (
                           <tr key={prompt.id} className="border-b border-slate-100 dark:border-slate-800 hover:bg-slate-50 dark:hover:bg-slate-800/50">
                             <td className="py-3 px-4">
-                              <div className="font-medium text-slate-900 dark:text-white">{prompt.name}</div>
-                              {prompt.description && <div className="text-sm text-slate-500 dark:text-slate-400 truncate max-w-xs">{prompt.description}</div>}
+                              <div className="font-medium text-slate-900 dark:text-white">{prompt.title || 'Untitled'}</div>
+                              <div className="text-sm text-slate-500 dark:text-slate-400 truncate max-w-xs">{prompt.prompt_text}</div>
                             </td>
-                            <td className="py-3 px-4 text-sm text-slate-600 dark:text-slate-300 capitalize">{prompt.category?.replace('_', ' ') || '—'}</td>
+                            <td className="py-3 px-4 text-sm text-slate-600 dark:text-slate-300 capitalize">{prompt.prompt_type?.replace('_', ' ') || '—'}</td>
                             <td className="py-3 px-4">
-                              <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${
-                                prompt.is_active ? 'bg-green-100 text-green-800' : 'bg-slate-100 text-slate-800'
+                              <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium capitalize ${
+                                prompt.status === 'finalized' ? 'bg-green-100 text-green-800' :
+                                prompt.status === 'used' ? 'bg-blue-100 text-blue-800' :
+                                'bg-slate-100 text-slate-800'
                               }`}>
-                                {prompt.is_active ? 'Active' : 'Archived'}
+                                {prompt.status?.replace('_', ' ') || 'draft'}
                               </span>
                             </td>
                             <td className="py-3 px-4 text-sm text-slate-600 dark:text-slate-300">v{prompt.version}</td>
@@ -2425,6 +2470,10 @@ export default function ProjectPage() {
               </div>
             </div>
             <div className="flex items-center gap-2">
+              <button onClick={() => setShowEditModal(true)} className="btn-secondary" title="Edit project title, description and genre">
+                <Edit className="w-4 h-4 mr-2" />
+                Edit
+              </button>
               <button onClick={openAutoGenerateModal} className="btn-primary" title="Generate the whole project with AI: bible, characters, locations, episodes and prompts">
                 <Sparkles className="w-4 h-4 mr-2" />
                 Auto-Generate
@@ -2489,6 +2538,9 @@ export default function ProjectPage() {
                       placeholder="THE BILLIONAIRE CEO"
                       required
                     />
+                    {autoGenForm.title && !autoGenForm.title.trim() && (
+                      <p className="text-sm text-red-600 mt-1">Title cannot be blank.</p>
+                    )}
                   </div>
                   <div>
                     <label htmlFor="autogen-genre" className="label">Genre</label>
@@ -2656,6 +2708,456 @@ export default function ProjectPage() {
                 </div>
               )}
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Edit Project modal */}
+      {showEditModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50">
+          <div className="bg-white dark:bg-slate-800 rounded-xl shadow-xl max-w-lg w-full max-h-[90vh] overflow-y-auto">
+            <div className="p-6 border-b border-slate-200 dark:border-slate-700 flex items-center justify-between">
+              <h2 className="text-xl font-semibold text-slate-900 dark:text-white">Edit Project</h2>
+              <button onClick={() => setShowEditModal(false)} className="btn-ghost p-2" title="Close">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <form onSubmit={handleUpdateProject} className="p-6 space-y-4">
+              <div>
+                <label htmlFor="edit-title" className="label">Title *</label>
+                <input id="edit-title" type="text" value={editTitle} onChange={(e) => setEditTitle(e.target.value)} className="input" required />
+              </div>
+              <div>
+                <label htmlFor="edit-description" className="label">Description</label>
+                <textarea id="edit-description" value={editDescription} onChange={(e) => setEditDescription(e.target.value)} className="input" rows={3} />
+              </div>
+              <div>
+                <label htmlFor="edit-genre" className="label">Genre</label>
+                <input id="edit-genre" type="text" value={editGenre} onChange={(e) => setEditGenre(e.target.value)} className="input" placeholder="Romance, Drama, Revenge…" />
+              </div>
+              <div className="flex justify-end gap-3">
+                <button type="button" onClick={() => setShowEditModal(false)} className="btn-secondary">Cancel</button>
+                <button type="submit" className="btn-primary" disabled={isSaving}>{isSaving ? 'Saving…' : 'Save changes'}</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Series Bible modal */}
+      {showSeriesBibleModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50">
+          <div className="bg-white dark:bg-slate-800 rounded-xl shadow-xl max-w-lg w-full max-h-[90vh] overflow-y-auto">
+            <div className="p-6 border-b border-slate-200 dark:border-slate-700 flex items-center justify-between">
+              <h2 className="text-xl font-semibold text-slate-900 dark:text-white">{seriesBible ? 'Edit Series Bible' : 'Create Series Bible'}</h2>
+              <button onClick={() => setShowSeriesBibleModal(false)} className="btn-ghost p-2" title="Close">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <form onSubmit={seriesBible ? handleUpdateSeriesBible : handleCreateSeriesBible} className="p-6 space-y-4">
+              <div>
+                <label htmlFor="bible-premise" className="label">Premise</label>
+                <textarea id="bible-premise" value={seriesBibleForm.premise} onChange={(e) => setSeriesBibleForm({ ...seriesBibleForm, premise: e.target.value })} className="input" rows={3} />
+              </div>
+              <div>
+                <label htmlFor="bible-main-plot" className="label">Main plot</label>
+                <textarea id="bible-main-plot" value={seriesBibleForm.main_plot} onChange={(e) => setSeriesBibleForm({ ...seriesBibleForm, main_plot: e.target.value })} className="input" rows={3} />
+              </div>
+              <div>
+                <label htmlFor="bible-subplots" className="label">Subplots (one per line)</label>
+                <textarea id="bible-subplots" value={seriesBibleForm.subplots} onChange={(e) => setSeriesBibleForm({ ...seriesBibleForm, subplots: e.target.value })} className="input" rows={3} />
+              </div>
+              <div>
+                <label htmlFor="bible-relationships" className="label">Character relationships</label>
+                <textarea id="bible-relationships" value={seriesBibleForm.character_relationships} onChange={(e) => setSeriesBibleForm({ ...seriesBibleForm, character_relationships: e.target.value })} className="input" rows={2} />
+              </div>
+              <div>
+                <label htmlFor="bible-world" className="label">World settings</label>
+                <textarea id="bible-world" value={seriesBibleForm.world_settings} onChange={(e) => setSeriesBibleForm({ ...seriesBibleForm, world_settings: e.target.value })} className="input" rows={2} />
+              </div>
+              <div>
+                <label htmlFor="bible-tone" className="label">Tone and visual style</label>
+                <textarea id="bible-tone" value={seriesBibleForm.tone_and_visual_style} onChange={(e) => setSeriesBibleForm({ ...seriesBibleForm, tone_and_visual_style: e.target.value })} className="input" rows={2} />
+              </div>
+              <div>
+                <label htmlFor="bible-ending" className="label">Ending direction</label>
+                <textarea id="bible-ending" value={seriesBibleForm.ending_direction} onChange={(e) => setSeriesBibleForm({ ...seriesBibleForm, ending_direction: e.target.value })} className="input" rows={2} />
+              </div>
+              <div>
+                <label htmlFor="bible-structure" className="label">Episode structure</label>
+                <textarea id="bible-structure" value={seriesBibleForm.episode_structure} onChange={(e) => setSeriesBibleForm({ ...seriesBibleForm, episode_structure: e.target.value })} className="input" rows={2} />
+              </div>
+              <div className="flex justify-end gap-3">
+                <button type="button" onClick={() => setShowSeriesBibleModal(false)} className="btn-secondary">Cancel</button>
+                <button type="submit" className="btn-primary" disabled={seriesBibleSaving}>{seriesBibleSaving ? 'Saving…' : (seriesBible ? 'Save changes' : 'Create')}</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Character modal */}
+      {showCharacterModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50">
+          <div className="bg-white dark:bg-slate-800 rounded-xl shadow-xl max-w-lg w-full max-h-[90vh] overflow-y-auto">
+            <div className="p-6 border-b border-slate-200 dark:border-slate-700 flex items-center justify-between">
+              <h2 className="text-xl font-semibold text-slate-900 dark:text-white">{editingCharacter ? 'Edit Character' : 'Add Character'}</h2>
+              <button onClick={() => setShowCharacterModal(false)} className="btn-ghost p-2" title="Close">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <form onSubmit={editingCharacter ? handleUpdateCharacter : handleCreateCharacter} className="p-6 space-y-4">
+              <div>
+                <label htmlFor="char-name" className="label">Name *</label>
+                <input id="char-name" type="text" value={characterForm.name || ''} onChange={(e) => setCharacterForm({ ...characterForm, name: e.target.value })} className="input" required />
+              </div>
+              <div>
+                <label htmlFor="char-role" className="label">Role</label>
+                <select id="char-role" value={characterForm.role || 'supporting'} onChange={(e) => setCharacterForm({ ...characterForm, role: e.target.value })} className="input">
+                  <option value="protagonist">Protagonist</option>
+                  <option value="antagonist">Antagonist</option>
+                  <option value="supporting">Supporting</option>
+                </select>
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label htmlFor="char-age" className="label">Age</label>
+                  <input id="char-age" type="text" value={characterForm.age || ''} onChange={(e) => setCharacterForm({ ...characterForm, age: e.target.value })} className="input" />
+                </div>
+                <div>
+                  <label htmlFor="char-gender" className="label">Gender</label>
+                  <input id="char-gender" type="text" value={characterForm.gender || ''} onChange={(e) => setCharacterForm({ ...characterForm, gender: e.target.value })} className="input" />
+                </div>
+              </div>
+              <div>
+                <label htmlFor="char-ethnicity" className="label">Ethnicity</label>
+                <input id="char-ethnicity" type="text" value={characterForm.ethnicity || ''} onChange={(e) => setCharacterForm({ ...characterForm, ethnicity: e.target.value })} className="input" />
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label htmlFor="char-height" className="label">Height</label>
+                  <input id="char-height" type="text" value={characterForm.height || ''} onChange={(e) => setCharacterForm({ ...characterForm, height: e.target.value })} className="input" />
+                </div>
+                <div>
+                  <label htmlFor="char-build" className="label">Build</label>
+                  <input id="char-build" type="text" value={characterForm.build || ''} onChange={(e) => setCharacterForm({ ...characterForm, build: e.target.value })} className="input" />
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label htmlFor="char-hair-color" className="label">Hair color</label>
+                  <input id="char-hair-color" type="text" value={characterForm.hair_color || ''} onChange={(e) => setCharacterForm({ ...characterForm, hair_color: e.target.value })} className="input" />
+                </div>
+                <div>
+                  <label htmlFor="char-hair-style" className="label">Hair style</label>
+                  <input id="char-hair-style" type="text" value={characterForm.hair_style || ''} onChange={(e) => setCharacterForm({ ...characterForm, hair_style: e.target.value })} className="input" />
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label htmlFor="char-eye-color" className="label">Eye color</label>
+                  <input id="char-eye-color" type="text" value={characterForm.eye_color || ''} onChange={(e) => setCharacterForm({ ...characterForm, eye_color: e.target.value })} className="input" />
+                </div>
+                <div>
+                  <label htmlFor="char-skin-tone" className="label">Skin tone</label>
+                  <input id="char-skin-tone" type="text" value={characterForm.skin_tone || ''} onChange={(e) => setCharacterForm({ ...characterForm, skin_tone: e.target.value })} className="input" />
+                </div>
+              </div>
+              <div>
+                <label htmlFor="char-features" className="label">Distinguishing features</label>
+                <textarea id="char-features" value={characterForm.distinguishing_features || ''} onChange={(e) => setCharacterForm({ ...characterForm, distinguishing_features: e.target.value })} className="input" rows={2} />
+              </div>
+              <div>
+                <label htmlFor="char-traits" className="label">Personality traits</label>
+                <textarea id="char-traits" value={characterForm.personality_traits || ''} onChange={(e) => setCharacterForm({ ...characterForm, personality_traits: e.target.value })} className="input" rows={2} />
+              </div>
+              <div>
+                <label htmlFor="char-background" className="label">Background</label>
+                <textarea id="char-background" value={characterForm.background || ''} onChange={(e) => setCharacterForm({ ...characterForm, background: e.target.value })} className="input" rows={3} />
+              </div>
+              <div>
+                <label htmlFor="char-motivations" className="label">Motivations</label>
+                <textarea id="char-motivations" value={characterForm.motivations || ''} onChange={(e) => setCharacterForm({ ...characterForm, motivations: e.target.value })} className="input" rows={2} />
+              </div>
+              <div>
+                <label htmlFor="char-fears" className="label">Fears</label>
+                <textarea id="char-fears" value={characterForm.fears || ''} onChange={(e) => setCharacterForm({ ...characterForm, fears: e.target.value })} className="input" rows={2} />
+              </div>
+              <div>
+                <label htmlFor="char-quirks" className="label">Quirks</label>
+                <textarea id="char-quirks" value={characterForm.quirks || ''} onChange={(e) => setCharacterForm({ ...characterForm, quirks: e.target.value })} className="input" rows={2} />
+              </div>
+              <div>
+                <label htmlFor="char-voice" className="label">Voice pattern</label>
+                <input id="char-voice" type="text" value={characterForm.voice_pattern || ''} onChange={(e) => setCharacterForm({ ...characterForm, voice_pattern: e.target.value })} className="input" />
+              </div>
+              <div>
+                <label htmlFor="char-physical" className="label">Physical traits</label>
+                <textarea id="char-physical" value={characterForm.physical_traits || ''} onChange={(e) => setCharacterForm({ ...characterForm, physical_traits: e.target.value })} className="input" rows={2} />
+              </div>
+              <div>
+                <label htmlFor="char-skills" className="label">Skills</label>
+                <textarea id="char-skills" value={characterForm.skills || ''} onChange={(e) => setCharacterForm({ ...characterForm, skills: e.target.value })} className="input" rows={2} />
+              </div>
+              <div>
+                <label htmlFor="char-costume" className="label">Costume style</label>
+                <input id="char-costume" type="text" value={characterForm.costume_style || ''} onChange={(e) => setCharacterForm({ ...characterForm, costume_style: e.target.value })} className="input" />
+              </div>
+              <div>
+                <label htmlFor="char-signature" className="label">Signature items</label>
+                <textarea id="char-signature" value={characterForm.signature_items || ''} onChange={(e) => setCharacterForm({ ...characterForm, signature_items: e.target.value })} className="input" rows={2} />
+              </div>
+              <div>
+                <label htmlFor="char-palette" className="label">Color palette</label>
+                <input id="char-palette" type="text" value={characterForm.color_palette || ''} onChange={(e) => setCharacterForm({ ...characterForm, color_palette: e.target.value })} className="input" />
+              </div>
+              <div>
+                <label htmlFor="char-images" className="label">Reference images</label>
+                <textarea id="char-images" value={characterForm.reference_images || ''} onChange={(e) => setCharacterForm({ ...characterForm, reference_images: e.target.value })} className="input" rows={2} />
+              </div>
+              <div>
+                <label htmlFor="char-consistency" className="label">Consistency instructions</label>
+                <textarea id="char-consistency" value={characterForm.consistency_instructions || ''} onChange={(e) => setCharacterForm({ ...characterForm, consistency_instructions: e.target.value })} className="input" rows={2} />
+              </div>
+              <div className="flex justify-end gap-3">
+                <button type="button" onClick={() => setShowCharacterModal(false)} className="btn-secondary">Cancel</button>
+                <button type="submit" className="btn-primary" disabled={characterSaving}>{characterSaving ? 'Saving…' : (editingCharacter ? 'Save changes' : 'Create')}</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Location modal */}
+      {showLocationModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50">
+          <div className="bg-white dark:bg-slate-800 rounded-xl shadow-xl max-w-lg w-full max-h-[90vh] overflow-y-auto">
+            <div className="p-6 border-b border-slate-200 dark:border-slate-700 flex items-center justify-between">
+              <h2 className="text-xl font-semibold text-slate-900 dark:text-white">{editingLocation ? 'Edit Location' : 'Add Location'}</h2>
+              <button onClick={() => setShowLocationModal(false)} className="btn-ghost p-2" title="Close">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <form onSubmit={editingLocation ? handleUpdateLocation : handleCreateLocation} className="p-6 space-y-4">
+              <div>
+                <label htmlFor="loc-name" className="label">Name *</label>
+                <input id="loc-name" type="text" value={locationForm.name || ''} onChange={(e) => setLocationForm({ ...locationForm, name: e.target.value })} className="input" required />
+              </div>
+              <div>
+                <label htmlFor="loc-type" className="label">Type</label>
+                <input id="loc-type" type="text" value={locationForm.type || ''} onChange={(e) => setLocationForm({ ...locationForm, type: e.target.value })} className="input" placeholder="interior, exterior, studio…" />
+              </div>
+              <div>
+                <label htmlFor="loc-description" className="label">Description</label>
+                <textarea id="loc-description" value={locationForm.description || ''} onChange={(e) => setLocationForm({ ...locationForm, description: e.target.value })} className="input" rows={3} />
+              </div>
+              <div>
+                <label htmlFor="loc-environment" className="label">Environment details</label>
+                <textarea id="loc-environment" value={locationForm.environment_details || ''} onChange={(e) => setLocationForm({ ...locationForm, environment_details: e.target.value })} className="input" rows={2} />
+              </div>
+              <div>
+                <label htmlFor="loc-images" className="label">Reference images</label>
+                <textarea id="loc-images" value={locationForm.reference_images || ''} onChange={(e) => setLocationForm({ ...locationForm, reference_images: e.target.value })} className="input" rows={2} />
+              </div>
+              <div>
+                <label htmlFor="loc-visual" className="label">Visual style notes</label>
+                <textarea id="loc-visual" value={locationForm.visual_style_notes || ''} onChange={(e) => setLocationForm({ ...locationForm, visual_style_notes: e.target.value })} className="input" rows={2} />
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label htmlFor="loc-lighting" className="label">Lighting</label>
+                  <input id="loc-lighting" type="text" value={locationForm.lighting || ''} onChange={(e) => setLocationForm({ ...locationForm, lighting: e.target.value })} className="input" />
+                </div>
+                <div>
+                  <label htmlFor="loc-atmosphere" className="label">Atmosphere</label>
+                  <input id="loc-atmosphere" type="text" value={locationForm.atmosphere || ''} onChange={(e) => setLocationForm({ ...locationForm, atmosphere: e.target.value })} className="input" />
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label htmlFor="loc-time" className="label">Time of day</label>
+                  <input id="loc-time" type="text" value={locationForm.time_of_day || ''} onChange={(e) => setLocationForm({ ...locationForm, time_of_day: e.target.value })} className="input" />
+                </div>
+                <div>
+                  <label htmlFor="loc-weather" className="label">Weather</label>
+                  <input id="loc-weather" type="text" value={locationForm.weather || ''} onChange={(e) => setLocationForm({ ...locationForm, weather: e.target.value })} className="input" />
+                </div>
+              </div>
+              <div>
+                <label htmlFor="loc-consistency" className="label">Consistency instructions</label>
+                <textarea id="loc-consistency" value={locationForm.consistency_instructions || ''} onChange={(e) => setLocationForm({ ...locationForm, consistency_instructions: e.target.value })} className="input" rows={2} />
+              </div>
+              <div className="flex justify-end gap-3">
+                <button type="button" onClick={() => setShowLocationModal(false)} className="btn-secondary">Cancel</button>
+                <button type="submit" className="btn-primary" disabled={locationSaving}>{locationSaving ? 'Saving…' : (editingLocation ? 'Save changes' : 'Create')}</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Episode modal */}
+      {showEpisodeModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50">
+          <div className="bg-white dark:bg-slate-800 rounded-xl shadow-xl max-w-lg w-full max-h-[90vh] overflow-y-auto">
+            <div className="p-6 border-b border-slate-200 dark:border-slate-700 flex items-center justify-between">
+              <h2 className="text-xl font-semibold text-slate-900 dark:text-white">{editingEpisode ? 'Edit Episode' : 'Add Episode'}</h2>
+              <button onClick={() => setShowEpisodeModal(false)} className="btn-ghost p-2" title="Close">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <form onSubmit={editingEpisode ? handleUpdateEpisode : handleCreateEpisode} className="p-6 space-y-4">
+              <div>
+                <label htmlFor="ep-number" className="label">Episode number *</label>
+                <input id="ep-number" type="number" min={1} value={episodeForm.episode_number ?? 1} onChange={(e) => setEpisodeForm({ ...episodeForm, episode_number: parseInt(e.target.value, 10) || 1 })} className="input" required />
+              </div>
+              <div>
+                <label htmlFor="ep-title" className="label">Title</label>
+                <input id="ep-title" type="text" value={episodeForm.title || ''} onChange={(e) => setEpisodeForm({ ...episodeForm, title: e.target.value })} className="input" />
+              </div>
+              <div>
+                <label htmlFor="ep-summary" className="label">Summary</label>
+                <textarea id="ep-summary" value={episodeForm.summary || ''} onChange={(e) => setEpisodeForm({ ...episodeForm, summary: e.target.value })} className="input" rows={3} />
+              </div>
+              <div>
+                <label htmlFor="ep-status" className="label">Status</label>
+                <select id="ep-status" value={episodeForm.status || 'planned'} onChange={(e) => setEpisodeForm({ ...episodeForm, status: e.target.value })} className="input">
+                  <option value="planned">Planned</option>
+                  <option value="outlined">Outlined</option>
+                  <option value="scenes_written">Scenes written</option>
+                  <option value="prompts_ready">Prompts ready</option>
+                  <option value="in_production">In production</option>
+                  <option value="post_production">Post production</option>
+                  <option value="completed">Completed</option>
+                </select>
+              </div>
+              <div className="flex justify-end gap-3">
+                <button type="button" onClick={() => setShowEpisodeModal(false)} className="btn-secondary">Cancel</button>
+                <button type="submit" className="btn-primary" disabled={episodeSaving}>{episodeSaving ? 'Saving…' : (editingEpisode ? 'Save changes' : 'Create')}</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Prompt modal */}
+      {showPromptModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50">
+          <div className="bg-white dark:bg-slate-800 rounded-xl shadow-xl max-w-lg w-full max-h-[90vh] overflow-y-auto">
+            <div className="p-6 border-b border-slate-200 dark:border-slate-700 flex items-center justify-between">
+              <h2 className="text-xl font-semibold text-slate-900 dark:text-white">{editingPrompt ? 'Edit Prompt' : 'Add Prompt'}</h2>
+              <button onClick={() => setShowPromptModal(false)} className="btn-ghost p-2" title="Close">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <form onSubmit={editingPrompt ? handleUpdatePrompt : handleCreatePrompt} className="p-6 space-y-4">
+              <div>
+                <label htmlFor="prompt-type" className="label">Type *</label>
+                <select id="prompt-type" value={promptForm.prompt_type || 'video_generation'} onChange={(e) => setPromptForm({ ...promptForm, prompt_type: e.target.value })} className="input">
+                  <option value="video_generation">Video Generation</option>
+                  <option value="character_image">Character Image</option>
+                  <option value="location_image">Location Image</option>
+                  <option value="scene_image">Scene Image</option>
+                  <option value="camera_movement">Camera Movement</option>
+                  <option value="character_action">Character Action</option>
+                  <option value="dialogue_audio">Dialogue Audio</option>
+                  <option value="sound_effect">Sound Effect</option>
+                  <option value="music">Music</option>
+                </select>
+              </div>
+              <div>
+                <label htmlFor="prompt-title" className="label">Title</label>
+                <input id="prompt-title" type="text" value={promptForm.title || ''} onChange={(e) => setPromptForm({ ...promptForm, title: e.target.value })} className="input" />
+              </div>
+              <div>
+                <label htmlFor="prompt-text" className="label">Prompt text *</label>
+                <textarea id="prompt-text" value={promptForm.prompt_text || ''} onChange={(e) => setPromptForm({ ...promptForm, prompt_text: e.target.value })} className="input" rows={5} required />
+              </div>
+              <div>
+                <label htmlFor="prompt-negative" className="label">Negative prompt</label>
+                <textarea id="prompt-negative" value={promptForm.negative_prompt || ''} onChange={(e) => setPromptForm({ ...promptForm, negative_prompt: e.target.value })} className="input" rows={2} />
+              </div>
+              <div className="flex justify-end gap-3">
+                <button type="button" onClick={() => setShowPromptModal(false)} className="btn-secondary">Cancel</button>
+                <button type="submit" className="btn-primary" disabled={promptSaving}>{promptSaving ? 'Saving…' : (editingPrompt ? 'Save changes' : 'Create')}</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Google OAuth modal */}
+      {showOauthModal && oauthUrl && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50">
+          <div className="bg-white dark:bg-slate-800 rounded-xl shadow-xl max-w-lg w-full max-h-[90vh] overflow-y-auto">
+            <div className="p-6 border-b border-slate-200 dark:border-slate-700 flex items-center justify-between">
+              <h2 className="text-xl font-semibold text-slate-900 dark:text-white">Connect Google Account</h2>
+              <button onClick={() => setShowOauthModal(false)} className="btn-ghost p-2" title="Close">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <div className="p-6 space-y-4">
+              <p className="text-sm text-slate-500 dark:text-slate-400">
+                Open the Google authorization page, sign in with the account you want to connect,
+                then come back here — the account appears in the list once Google redirects back.
+              </p>
+              <a href={oauthUrl} target="_blank" rel="noopener noreferrer" className="btn-primary inline-flex items-center">
+                Open Google authorization
+              </a>
+              <p className="text-xs text-slate-400 dark:text-slate-500 break-all">{oauthUrl}</p>
+              <div className="flex justify-end gap-3">
+                <button onClick={() => { setShowOauthModal(false); fetchGoogleAccounts(); }} className="btn-secondary">Done — refresh list</button>
+                <button onClick={() => setShowOauthModal(false)} className="btn-primary">Close</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Flow Task modal */}
+      {showFlowTaskModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50">
+          <div className="bg-white dark:bg-slate-800 rounded-xl shadow-xl max-w-lg w-full max-h-[90vh] overflow-y-auto">
+            <div className="p-6 border-b border-slate-200 dark:border-slate-700 flex items-center justify-between">
+              <h2 className="text-xl font-semibold text-slate-900 dark:text-white">{editingFlowTask ? 'Edit Flow Task' : 'Add Flow Task'}</h2>
+              <button onClick={() => setShowFlowTaskModal(false)} className="btn-ghost p-2" title="Close">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <form onSubmit={editingFlowTask ? handleUpdateFlowTask : handleCreateFlowTask} className="p-6 space-y-4">
+              <div>
+                <label htmlFor="flow-title" className="label">Title *</label>
+                <input id="flow-title" type="text" value={flowTaskForm.title || ''} onChange={(e) => setFlowTaskForm({ ...flowTaskForm, title: e.target.value })} className="input" required />
+              </div>
+              <div>
+                <label htmlFor="flow-description" className="label">Description</label>
+                <textarea id="flow-description" value={flowTaskForm.description || ''} onChange={(e) => setFlowTaskForm({ ...flowTaskForm, description: e.target.value })} className="input" rows={2} />
+              </div>
+              <div>
+                <label htmlFor="flow-type" className="label">Task type</label>
+                <input id="flow-type" type="text" value={flowTaskForm.task_type || ''} onChange={(e) => setFlowTaskForm({ ...flowTaskForm, task_type: e.target.value })} className="input" placeholder="image_gen, video_gen…" />
+              </div>
+              <div>
+                <label htmlFor="flow-prompts" className="label">Input prompts (JSON or text)</label>
+                <textarea id="flow-prompts" value={flowTaskForm.input_prompts || ''} onChange={(e) => setFlowTaskForm({ ...flowTaskForm, input_prompts: e.target.value })} className="input" rows={3} />
+              </div>
+              <div>
+                <label htmlFor="flow-references" className="label">Input references (JSON list or text)</label>
+                <textarea id="flow-references" value={flowTaskForm.input_references || ''} onChange={(e) => setFlowTaskForm({ ...flowTaskForm, input_references: e.target.value })} className="input" rows={2} />
+              </div>
+              <div>
+                <label htmlFor="flow-parameters" className="label">Input parameters (JSON or text)</label>
+                <textarea id="flow-parameters" value={flowTaskForm.input_parameters || ''} onChange={(e) => setFlowTaskForm({ ...flowTaskForm, input_parameters: e.target.value })} className="input" rows={2} />
+              </div>
+              <div>
+                <label htmlFor="flow-priority" className="label">Priority</label>
+                <input id="flow-priority" type="number" min={0} value={flowTaskForm.priority ?? 0} onChange={(e) => setFlowTaskForm({ ...flowTaskForm, priority: parseInt(e.target.value, 10) || 0 })} className="input" />
+              </div>
+              <div className="flex justify-end gap-3">
+                <button type="button" onClick={() => setShowFlowTaskModal(false)} className="btn-secondary">Cancel</button>
+                <button type="submit" className="btn-primary" disabled={flowTaskSaving}>{flowTaskSaving ? 'Saving…' : (editingFlowTask ? 'Save changes' : 'Create')}</button>
+              </div>
+            </form>
           </div>
         </div>
       )}

@@ -714,7 +714,7 @@ async def delete_shot(
 # ---------------------------------------------------------------------------
 from app.models.dialogue import Dialogue
 from app.models.episode_revision import EpisodeRevision
-from app.schemas.dialogue import DialogueCreate, DialogueResponse
+from app.schemas.dialogue import DialogueCreate, DialogueUpdate, DialogueResponse
 from app.schemas.episode_revision import EpisodeRevisionCreate, EpisodeRevisionResponse
 
 
@@ -783,6 +783,62 @@ async def create_dialogue(
     await db.refresh(dialogue)
     create_audit_log(
         db, current_user.id, AuditAction.DIALOGUE_CREATE,
+        resource_type="dialogue", resource_id=dialogue.id,
+        ip_address=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+        new_values={"character_name": dialogue.character_name, "line_number": dialogue.line_number}
+    )
+    await db.commit()
+    return dialogue
+
+
+@router.get("/{project_id}/episodes/{episode_id}/scenes/{scene_id}/dialogues/{dialogue_id}", response_model=DialogueResponse)
+async def get_dialogue(
+    project_id: str,
+    episode_id: str,
+    scene_id: str,
+    dialogue_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    await get_project_or_404(project_id, current_user.id, db)
+    await _get_episode_or_404(episode_id, project_id, db)
+    await _get_scene_or_404(scene_id, episode_id, db)
+    result = await db.execute(
+        select(Dialogue).where(Dialogue.id == dialogue_id, Dialogue.scene_id == scene_id)
+    )
+    dialogue = result.scalar_one_or_none()
+    if not dialogue:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dialogue not found")
+    return dialogue
+
+
+@router.patch("/{project_id}/episodes/{episode_id}/scenes/{scene_id}/dialogues/{dialogue_id}", response_model=DialogueResponse)
+async def update_dialogue(
+    project_id: str,
+    episode_id: str,
+    scene_id: str,
+    dialogue_id: str,
+    dialogue_data: DialogueUpdate,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    await get_project_or_404(project_id, current_user.id, db)
+    await _get_episode_or_404(episode_id, project_id, db)
+    await _get_scene_or_404(scene_id, episode_id, db)
+    result = await db.execute(
+        select(Dialogue).where(Dialogue.id == dialogue_id, Dialogue.scene_id == scene_id)
+    )
+    dialogue = result.scalar_one_or_none()
+    if not dialogue:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dialogue not found")
+    for field, value in dialogue_data.model_dump(exclude_unset=True).items():
+        setattr(dialogue, field, value)
+    await db.commit()
+    await db.refresh(dialogue)
+    create_audit_log(
+        db, current_user.id, AuditAction.DIALOGUE_UPDATE,
         resource_type="dialogue", resource_id=dialogue.id,
         ip_address=request.client.host if request.client else None,
         user_agent=request.headers.get("user-agent"),
@@ -882,3 +938,56 @@ async def create_episode_revision(
     )
     await db.commit()
     return revision
+
+
+@router.get("/{project_id}/episodes/{episode_id}/revisions/{revision_id}", response_model=EpisodeRevisionResponse)
+async def get_episode_revision(
+    project_id: str,
+    episode_id: str,
+    revision_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    await get_project_or_404(project_id, current_user.id, db)
+    await _get_episode_or_404(episode_id, project_id, db)
+    result = await db.execute(
+        select(EpisodeRevision).where(
+            EpisodeRevision.id == revision_id, EpisodeRevision.episode_id == episode_id
+        )
+    )
+    revision = result.scalar_one_or_none()
+    if not revision:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Episode revision not found")
+    return revision
+
+
+@router.delete("/{project_id}/episodes/{episode_id}/revisions/{revision_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_episode_revision(
+    project_id: str,
+    episode_id: str,
+    revision_id: str,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    # Revisions are immutable snapshots: no update endpoint by design.
+    # Delete only removes the snapshot row, never the episode itself.
+    await get_project_or_404(project_id, current_user.id, db)
+    await _get_episode_or_404(episode_id, project_id, db)
+    result = await db.execute(
+        select(EpisodeRevision).where(
+            EpisodeRevision.id == revision_id, EpisodeRevision.episode_id == episode_id
+        )
+    )
+    revision = result.scalar_one_or_none()
+    if not revision:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Episode revision not found")
+    create_audit_log(
+        db, current_user.id, AuditAction.EPISODE_REVISION_DELETE,
+        resource_type="episode_revision", resource_id=revision.id,
+        ip_address=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+        old_values={"episode_id": episode_id, "revision_number": revision.revision_number}
+    )
+    await db.delete(revision)
+    await db.commit()

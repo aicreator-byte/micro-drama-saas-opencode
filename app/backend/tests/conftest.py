@@ -2,6 +2,12 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Config now reads the leg-root .env from any CWD; that .env ships a
+# postgresql+asyncpg DATABASE_URL, but asyncpg is not installed here.
+# Pin sqlite before the app is imported so test collection never touches
+# the real DATABASE_URL (the test engine is in-memory regardless).
+os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
+
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient

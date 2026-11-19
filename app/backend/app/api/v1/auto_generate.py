@@ -8,6 +8,12 @@ continues with the later pending steps. Re-running a job/step never
 duplicates rows: existing characters/locations (by name), episodes (by
 number) and video prompts (by episode) are skipped.
 
+Steps run ASYNC: POST creates the job and returns 201 immediately with
+status RUNNING; the steps run in a background task on the same engine and
+GET polls the per-step status (live progress, audit O1). A job left
+RUNNING when the server restarts is NOT resumed automatically — poll the
+job and retry its failed step.
+
 Reuses the existing Story Engine LLM helpers where they fit:
 - step 4 uses generate_story_outline_llm + apply_outline_episodes
 - step 3 uses generate_world_building_llm (works with zero locations)
@@ -20,8 +26,9 @@ produce them from an empty project:
 No video is ever executed here (spec section 8): step 5 only writes
 VIDEO_GENERATION prompt rows for manual use in Google Flow.
 """
+import asyncio
 from fastapi import APIRouter, Depends, HTTPException, status, Request
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy import select
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
@@ -56,6 +63,15 @@ router = APIRouter()
 
 # Number of characters step 2 asks the LLM to invent (spec: default 4-6).
 DEFAULT_CHARACTER_COUNT = 5
+
+# Spec §9.1 minimums (audit O5): a step FAILS when its usable output is
+# below the minimum — not only when it is zero.
+MIN_CHARACTERS = 4
+MIN_LOCATIONS = 3
+
+# One LLM call per chunk of episodes, never a single call for all of them
+# (audit O4: one call for 30 episodes risks truncation).
+PROMPTS_CHUNK_SIZE = 5
 
 
 def job_to_response(job: AutoGenerateJob) -> AutoGenerateJobResponse:
@@ -155,16 +171,23 @@ def _as_text(value: Any) -> Optional[str]:
 
 def build_series_bible_prompt(title: str, genre: Optional[str], total_episodes: int, premise: Optional[str]) -> str:
     genre_line = f"Genre: {genre}\n" if genre else ""
+    genre_ask = (
+        'Use the genre given above for "genre".'
+        if genre else
+        'Infer the genre from the title and put one or two words in "genre" '
+        '(e.g. Romance, Thriller, Revenge) — never leave it blank, never guess "drama" by default.'
+    )
     premise_line = f"Premise hint from the user: {premise}\n" if premise else ""
     return f"""You are a professional TV series writer. Create a complete series bible for a micro-drama series.
 
 Title: {title}
 {genre_line}{premise_line}Total episodes planned: {total_episodes}
 
-Write all content in the same language as the title above.
+Write all content in the same language as the title above. {genre_ask}
 
 Generate a JSON response with this exact structure:
 {{
+  "genre": "One or two words: the genre of this series",
   "premise": "One-paragraph hook: who the story is about and the central conflict",
   "main_plot": "2-3 paragraph main plot",
   "subplots": ["Subplot 1 title: one-sentence description", "Subplot 2 title: one-sentence description"],
@@ -276,6 +299,15 @@ async def _run_step_series_bible(db: AsyncSession, job: AutoGenerateJob, project
     }
     if not fields["premise"] and not fields["main_plot"]:
         raise HTTPException(status_code=502, detail="AI returned an empty series bible")
+    # Genre inference (no silent default): when the user gave no genre,
+    # take the LLM's inferred genre for the job. When the LLM gives none,
+    # job.genre stays None — an honest blank, never a guessed "drama".
+    inferred_genre = None
+    if job.genre is None:
+        raw_genre = str(output.get("genre") or "").strip()
+        if raw_genre:
+            inferred_genre = raw_genre[:100]
+            job.genre = inferred_genre
     if bible is None:
         bible = SeriesBible(project_id=project.id, **fields)
         db.add(bible)
@@ -284,7 +316,12 @@ async def _run_step_series_bible(db: AsyncSession, job: AutoGenerateJob, project
             if value is not None:
                 setattr(bible, key, value)
     await db.flush()
-    return {"series_bible_id": bible.id, "reused_existing": False}
+    return {
+        "series_bible_id": bible.id,
+        "reused_existing": False,
+        "genre": job.genre,
+        "genre_inferred": inferred_genre is not None,
+    }
 
 
 async def _run_step_characters(db: AsyncSession, job: AutoGenerateJob, project: Project, user: User) -> Dict[str, Any]:
@@ -326,10 +363,20 @@ async def _run_step_characters(db: AsyncSession, job: AutoGenerateJob, project: 
         existing_names.add(name.lower())
         created.append(name)
         order += 1
-    if not created and not existing_names:
-        raise HTTPException(status_code=502, detail="AI returned no usable characters")
+    # Spec §9.1 (audit O5): the step FAILS when the usable cast is below
+    # the minimum — not only when it is zero. existing_names holds the
+    # pre-existing cast plus everything created above.
+    total_characters = len(existing_names)
+    if total_characters < MIN_CHARACTERS:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Only {total_characters} usable character(s), "
+                f"minimum is {MIN_CHARACTERS} (spec §9.1) — retry the step"
+            ),
+        )
     await db.flush()
-    return {"created_characters": created, "skipped": skipped}
+    return {"created_characters": created, "skipped": skipped, "total_characters": total_characters}
 
 
 async def _run_step_locations(db: AsyncSession, job: AutoGenerateJob, project: Project, user: User) -> Dict[str, Any]:
@@ -362,10 +409,19 @@ async def _run_step_locations(db: AsyncSession, job: AutoGenerateJob, project: P
         existing_names.add(name.lower())
         created.append(name)
         order += 1
-    if not created and not existing_names:
-        raise HTTPException(status_code=502, detail="AI returned no usable locations")
+    # Spec §9.1 (audit O5): the step FAILS when the usable locations are
+    # below the minimum — not only when there are zero.
+    total_locations = len(existing_names)
+    if total_locations < MIN_LOCATIONS:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Only {total_locations} usable location(s), "
+                f"minimum is {MIN_LOCATIONS} (spec §9.1) — retry the step"
+            ),
+        )
     await db.flush()
-    return {"created_locations": created, "skipped": skipped}
+    return {"created_locations": created, "skipped": skipped, "total_locations": total_locations}
 
 
 async def _run_step_episodes(db: AsyncSession, job: AutoGenerateJob, project: Project, user: User) -> Dict[str, Any]:
@@ -391,13 +447,6 @@ async def _run_step_prompts(db: AsyncSession, job: AutoGenerateJob, project: Pro
     char_result = await db.execute(select(Character).where(Character.project_id == project.id))
     characters = list(char_result.scalars().all())
 
-    output = await _chat_json(
-        db, build_video_prompts_prompt(bible, characters, episodes), max_tokens=8000
-    )
-    invented = output.get("prompts") or []
-    if not isinstance(invented, list) or not invented:
-        raise HTTPException(status_code=502, detail="AI returned no video prompts")
-
     by_number = {e.episode_number: e for e in episodes}
     existing_result = await db.execute(
         select(Prompt.episode_id).where(
@@ -406,32 +455,72 @@ async def _run_step_prompts(db: AsyncSession, job: AutoGenerateJob, project: Pro
         )
     )
     prompted_episode_ids = {row[0] for row in existing_result.all()}
-    created, skipped = [], []
-    for entry in invented:
-        if not isinstance(entry, dict):
-            continue
-        try:
-            number = int(entry.get("episode_number"))
-        except (TypeError, ValueError):
-            skipped.append({"episode": entry.get("title"), "reason": "missing episode_number"})
-            continue
-        episode = by_number.get(number)
-        if episode is None:
-            skipped.append({"episode_number": number, "reason": "episode not found"})
-            continue
-        if episode.id in prompted_episode_ids:
-            skipped.append({"episode_number": number, "reason": "prompt already exists"})
-            continue
-        prompt_text = str(entry.get("prompt_text") or "").strip()
-        if not prompt_text:
-            skipped.append({"episode_number": number, "reason": "empty prompt_text"})
-            continue
+    # Only episodes without a prompt are sent to the LLM (idempotent retry
+    # skips the ones already covered).
+    missing_episodes = [e for e in episodes if e.id not in prompted_episode_ids]
+    if not missing_episodes:
+        return {"created_prompts": [], "skipped": [], "already_covered": len(episodes)}
+
+    # Chunked LLM calls (audit O4): one call per chunk of episodes, never
+    # one call for all of them — a single call for 30 episodes risks
+    # truncation. Nothing is written to the DB until every chunk is in.
+    collected: Dict[int, Dict[str, Any]] = {}
+    skipped = []
+    for start in range(0, len(missing_episodes), PROMPTS_CHUNK_SIZE):
+        chunk = missing_episodes[start:start + PROMPTS_CHUNK_SIZE]
+        output = await _chat_json(
+            db, build_video_prompts_prompt(bible, characters, chunk), max_tokens=8000
+        )
+        invented = output.get("prompts") or []
+        if not isinstance(invented, list):
+            raise HTTPException(status_code=502, detail="AI returned no video prompts")
+        for entry in invented:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                number = int(entry.get("episode_number"))
+            except (TypeError, ValueError):
+                skipped.append({"episode": entry.get("title"), "reason": "missing episode_number"})
+                continue
+            episode = by_number.get(number)
+            if episode is None:
+                skipped.append({"episode_number": number, "reason": "episode not found"})
+                continue
+            if episode.id in prompted_episode_ids:
+                skipped.append({"episode_number": number, "reason": "prompt already exists"})
+                continue
+            if number in collected:
+                skipped.append({"episode_number": number, "reason": "duplicate in AI output"})
+                continue
+            prompt_text = str(entry.get("prompt_text") or "").strip()
+            if not prompt_text:
+                skipped.append({"episode_number": number, "reason": "empty prompt_text"})
+                continue
+            collected[number] = entry
+
+    # Full coverage (audit O3, like Hermes): the step FAILS when any
+    # episode is left without a prompt — no partial insert, retry the step.
+    still_missing = [
+        e.episode_number for e in missing_episodes if e.episode_number not in collected
+    ]
+    if still_missing:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "AI did not cover all episodes; missing video prompts for "
+                f"episode(s): {still_missing} — no prompts were written, retry the step"
+            ),
+        )
+
+    created = []
+    for number, entry in collected.items():
+        episode = by_number[number]
         prompt = Prompt(
             project_id=project.id,
             episode_id=episode.id,
             prompt_type=PromptType.VIDEO_GENERATION,
             title=(str(entry.get("title") or f"Video prompt episode {number}"))[:255],
-            prompt_text=prompt_text,
+            prompt_text=str(entry.get("prompt_text")).strip(),
             negative_prompt=_as_text(entry.get("negative_prompt")),
             status=PromptStatus.DRAFT,
             created_by=user.id,
@@ -439,8 +528,6 @@ async def _run_step_prompts(db: AsyncSession, job: AutoGenerateJob, project: Pro
         db.add(prompt)
         prompted_episode_ids.add(episode.id)
         created.append({"episode_number": number, "title": prompt.title})
-    if not created and not prompted_episode_ids:
-        raise HTTPException(status_code=502, detail="AI returned no usable video prompts")
     await db.flush()
     return {"created_prompts": created, "skipped": skipped}
 
@@ -480,6 +567,10 @@ async def _execute_steps(
         step.status = AutoGenerateStepStatus.RUNNING
         step.error_message = None
         await db.commit()
+        # Capture the label before the runner below: a rollback in the
+        # failure path expires the row, and reading step.step afterwards
+        # would refresh (and wipe) the FAILED marking we just set.
+        step_label = step.step.value
         try:
             result = await STEP_RUNNERS[step.step](db, job, project, user)
             step.result = result
@@ -487,19 +578,24 @@ async def _execute_steps(
             step.completed_at = datetime.now(timezone.utc)
         except HTTPException as e:
             detail = e.detail if isinstance(e.detail, str) else str(e.detail)
+            # Discard the failed step's partial writes first (audit O6:
+            # a failed step must not leave half its rows behind), then mark
+            # the step/job FAILED in a clean state and commit only that.
+            await db.rollback()
             step.status = AutoGenerateStepStatus.FAILED
             step.error_message = detail
             step.completed_at = datetime.now(timezone.utc)
             job.status = AutoGenerateJobStatus.FAILED
-            job.error_message = f"Step {step.step.value} failed: {detail}"
+            job.error_message = f"Step {step_label} failed: {detail}"
             await db.commit()
             return job
         except Exception as e:
+            await db.rollback()
             step.status = AutoGenerateStepStatus.FAILED
             step.error_message = str(e)
             step.completed_at = datetime.now(timezone.utc)
             job.status = AutoGenerateJobStatus.FAILED
-            job.error_message = f"Step {step.step.value} failed: {e}"
+            job.error_message = f"Step {step_label} failed: {e}"
             await db.commit()
             return job
         await db.commit()
@@ -510,6 +606,57 @@ async def _execute_steps(
     return job
 
 
+async def _run_job_in_background(
+    engine,
+    job_id: str,
+    project_id: str,
+    user_id: str,
+    from_step: Optional[AutoGenerateStepName] = None,
+) -> None:
+    """Run a job's pending steps outside the request (live progress via GET).
+
+    Own session on the SAME engine the request used, so tests (in-memory
+    engine) and production (file/postgres engine) both see the same rows.
+    The RUN audit is written here, at completion, with no request context.
+    Never raises: an unexpected failure marks the job FAILED instead of
+    leaving it stuck RUNNING.
+    """
+    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    try:
+        async with factory() as session:
+            job = await _get_job_or_404(job_id, project_id, session)
+            project_result = await session.execute(
+                select(Project).where(Project.id == project_id)
+            )
+            project = project_result.scalar_one_or_none()
+            user_result = await session.execute(
+                select(User).where(User.id == user_id)
+            )
+            user = user_result.scalar_one_or_none()
+            if project is None or user is None:
+                return
+            await _execute_steps(session, job, project, user, from_step=from_step)
+            create_audit_log(
+                session, user_id, AuditAction.AUTO_GENERATE_RUN,
+                resource_type="auto_generate_job", resource_id=job.id,
+                success=job.status == AutoGenerateJobStatus.COMPLETED,
+                error_message=job.error_message,
+                new_values={"status": job.status.value},
+            )
+            await session.commit()
+    except Exception as exc:
+        # Never leave a job stuck RUNNING because the runner itself died.
+        try:
+            async with factory() as session:
+                job = await _get_job_or_404(job_id, project_id, session)
+                if job.status == AutoGenerateJobStatus.RUNNING:
+                    job.status = AutoGenerateJobStatus.FAILED
+                    job.error_message = f"Background runner failed: {exc}"
+                    await session.commit()
+        except Exception:
+            pass
+
+
 @router.post("/{project_id}/auto-generate", response_model=AutoGenerateJobResponse, status_code=status.HTTP_201_CREATED)
 async def create_auto_generate_job(
     project_id: str,
@@ -518,15 +665,14 @@ async def create_auto_generate_job(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Create an auto-generate job and run its 5 steps in order (sync, like
-    the story-engine execute endpoint)."""
-    project = await get_project_or_404(project_id, current_user.id, db)
+    """Create an auto-generate job and start its 5 steps in the background.
 
-    # The job input is the source of truth for the project header.
-    project.title = body.title
-    if body.genre is not None:
-        project.genre = body.genre
-    project.total_episodes = body.total_episodes
+    Returns 201 immediately with status RUNNING; poll GET for the live
+    per-step progress. The job input is stored on the job itself and never
+    rewrites the project header (audit O7): a failed job used to leave the
+    project title/genre/total_episodes changed.
+    """
+    project = await get_project_or_404(project_id, current_user.id, db)
 
     job = AutoGenerateJob(
         project_id=project_id,
@@ -557,18 +703,11 @@ async def create_auto_generate_job(
     )
     await db.commit()
 
-    await _execute_steps(db, job, project, current_user)
-
-    create_audit_log(
-        db, current_user.id, AuditAction.AUTO_GENERATE_RUN,
-        resource_type="auto_generate_job", resource_id=job.id,
-        ip_address=request.client.host if request.client else None,
-        user_agent=request.headers.get("user-agent"),
-        success=job.status == AutoGenerateJobStatus.COMPLETED,
-        error_message=job.error_message,
-        new_values={"status": job.status.value},
+    # Async (audit O1): run the steps in the background on the same engine
+    # the request used; GET polls the live per-step status.
+    asyncio.create_task(
+        _run_job_in_background(db.bind, job.id, project.id, current_user.id)
     )
-    await db.commit()
     await db.refresh(job, attribute_names=["steps"])
     return job_to_response(job)
 
@@ -624,6 +763,18 @@ async def retry_auto_generate_step(
     )
     await db.commit()
 
-    await _execute_steps(db, job, project, current_user, from_step=step_name)
+    # Reset the failed step and continue in the background, so the modal
+    # can poll the live per-step progress instead of waiting on one call.
+    target.status = AutoGenerateStepStatus.PENDING
+    target.error_message = None
+    job.status = AutoGenerateJobStatus.RUNNING
+    job.error_message = None
+    await db.commit()
+
+    asyncio.create_task(
+        _run_job_in_background(
+            db.bind, job.id, project.id, current_user.id, from_step=step_name
+        )
+    )
     await db.refresh(job, attribute_names=["steps"])
     return job_to_response(job)
