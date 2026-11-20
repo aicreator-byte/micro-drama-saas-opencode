@@ -66,6 +66,192 @@ def make_json_serializable(obj: Any) -> Any:
     return obj
 
 
+def _export_title(data: Dict[str, Any]) -> str:
+    """Judul naskah dari data export apa pun bentuknya."""
+    project = data.get("project") or {}
+    episode = data.get("episode") or {}
+    if isinstance(project, dict) and project.get("title"):
+        return str(project["title"])
+    if isinstance(episode, dict) and episode.get("title"):
+        return str(episode["title"])
+    episodes = data.get("episodes") or []
+    if episodes and isinstance(episodes[0], dict) and episodes[0].get("title"):
+        return str(episodes[0]["title"])
+    return "Untitled"
+
+
+def _export_scenes(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Kumpulkan scene dari semua bentuk data export (episode/full/scenes)."""
+    scenes = data.get("scenes") or []
+    if scenes:
+        return [s for s in scenes if isinstance(s, dict)]
+    # Bentuk project export: episode tidak membawa scene; tidak ada yang bisa dibuat.
+    return []
+
+
+def _scene_time_of_day(scene: Dict[str, Any]) -> str:
+    tod = str(scene.get("time_of_day") or "").strip().lower()
+    if "night" in tod or "malam" in tod or "evening" in tod:
+        return "NIGHT"
+    return "DAY"
+
+
+def _parse_scene_dialogue(scene: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Parse kolom dialogue scene (JSON list / string) jadi baris dialog.
+
+    Bentuk yang didukung: [{"character":..,"text":..}],
+    [{"character_name":..,"dialogue_text":..,"parenthetical":..}],
+    atau string biasa (diperlakukan sebagai satu aksi).
+    """
+    raw = scene.get("dialogue")
+    if not raw:
+        return []
+    if isinstance(raw, list):
+        items = raw
+    elif isinstance(raw, str):
+        try:
+            items = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return [{"action": raw}]
+        if isinstance(items, dict):
+            items = [items]
+        if not isinstance(items, list):
+            return [{"action": str(raw)}]
+    else:
+        return []
+    rows: List[Dict[str, str]] = []
+    for item in items:
+        if isinstance(item, str):
+            rows.append({"action": item})
+            continue
+        if not isinstance(item, dict):
+            continue
+        char = item.get("character") or item.get("character_name") or ""
+        text = item.get("text") or item.get("dialogue_text") or item.get("line") or ""
+        if char and text:
+            row: Dict[str, str] = {"character": str(char), "text": str(text)}
+            if item.get("parenthetical"):
+                row["parenthetical"] = str(item["parenthetical"])
+            rows.append(row)
+        elif text:
+            rows.append({"action": str(text)})
+        elif item.get("action"):
+            rows.append({"action": str(item["action"])})
+    return rows
+
+
+def format_fountain(data: Dict[str, Any]) -> str:
+    """Naskah screenplay format Fountain dari episode+scenes+dialogue.
+
+    Bila data kosong tetap hasilkan Title Page minimal.
+    """
+    title = _export_title(data)
+    lines: List[str] = [
+        "Title: " + title,
+        "Credit: Written by",
+        "Draft date: " + datetime.now(timezone.utc).date().isoformat(),
+        "",
+        "",
+    ]
+    scenes = _export_scenes(data)
+    episodes = data.get("episodes") or []
+    if not scenes and episodes:
+        # Bentuk full_project tanpa scene: satu slugline per episode.
+        for i, ep in enumerate(episodes):
+            if not isinstance(ep, dict):
+                continue
+            ep_title = str(ep.get("title") or f"Episode {ep.get('episode_number', i + 1)}")
+            lines.append(f"INT. {ep_title.upper()} - DAY")
+            lines.append("")
+            if ep.get("summary"):
+                lines.append(str(ep["summary"]))
+                lines.append("")
+            if i < len(episodes) - 1:
+                lines.append("CUT TO:")
+                lines.append("")
+        return "\n".join(lines)
+
+    for i, scene in enumerate(scenes):
+        place = str(scene.get("title") or scene.get("description") or "Unknown Location")
+        # Slugline Fountain: INT./EXT. + lokasi + waktu
+        lines.append(f"INT. {place.strip().upper()} - {_scene_time_of_day(scene)}")
+        lines.append("")
+        if scene.get("description"):
+            lines.append(str(scene["description"]))
+            lines.append("")
+        if scene.get("action"):
+            lines.append(str(scene["action"]))
+            lines.append("")
+        for row in _parse_scene_dialogue(scene):
+            if "character" in row:
+                lines.append(row["character"].strip().upper())
+                if row.get("parenthetical"):
+                    lines.append(f"({row['parenthetical']})")
+                lines.append(row["text"])
+                lines.append("")
+            else:
+                lines.append(row["action"])
+                lines.append("")
+        if i < len(scenes) - 1:
+            lines.append("CUT TO:")
+            lines.append("")
+    return "\n".join(lines)
+
+
+def format_final_draft(data: Dict[str, Any]) -> str:
+    """XML FDX (Final Draft) valid dari data export yang sama."""
+    import xml.etree.ElementTree as ET
+
+    title = _export_title(data)
+    root = ET.Element("FinalDraft", {
+        "DocumentType": "Script",
+        "Template": "No",
+        "Version": "1",
+    })
+
+    title_page = ET.SubElement(root, "TitlePage")
+    tp_content = ET.SubElement(title_page, "Content")
+    tp_para = ET.SubElement(tp_content, "Paragraph", {"Type": "Title"})
+    tp_text = ET.SubElement(tp_para, "Text")
+    tp_text.text = title
+
+    content = ET.SubElement(root, "Content")
+    scenes = _export_scenes(data)
+    episodes = data.get("episodes") or []
+
+    def add_para(ptype: str, text: str) -> None:
+        para = ET.SubElement(content, "Paragraph", {"Type": ptype})
+        el = ET.SubElement(para, "Text")
+        el.text = text
+
+    if not scenes and episodes:
+        for ep in episodes:
+            if not isinstance(ep, dict):
+                continue
+            ep_title = str(ep.get("title") or f"Episode {ep.get('episode_number', '')}")
+            add_para("Scene Heading", f"INT. {ep_title.upper()} - DAY")
+            if ep.get("summary"):
+                add_para("Action", str(ep["summary"]))
+        return ET.tostring(root, encoding="unicode", xml_declaration=True)
+
+    for scene in scenes:
+        place = str(scene.get("title") or scene.get("description") or "Unknown Location")
+        add_para("Scene Heading", f"INT. {place.strip().upper()} - {_scene_time_of_day(scene)}")
+        if scene.get("description"):
+            add_para("Action", str(scene["description"]))
+        if scene.get("action"):
+            add_para("Action", str(scene["action"]))
+        for row in _parse_scene_dialogue(scene):
+            if "character" in row:
+                add_para("Character", row["character"].strip().upper())
+                if row.get("parenthetical"):
+                    add_para("Parenthetical", f"({row['parenthetical']})")
+                add_para("Dialogue", row["text"])
+            else:
+                add_para("Action", row["action"])
+    return ET.tostring(root, encoding="unicode", xml_declaration=True)
+
+
 def format_export(data: Dict[str, Any], format: ExportFormat) -> tuple[bytes, str]:
     """Format export data according to format. Returns (content_bytes, mime_type)."""
     if format == ExportFormat.JSON:
@@ -95,6 +281,12 @@ def format_export(data: Dict[str, Any], format: ExportFormat) -> tuple[bytes, st
         dict_to_md(data)
         content = "\n".join(md_lines).encode('utf-8')
         mime = "text/markdown"
+    elif format == ExportFormat.FOUNTAIN:
+        content = format_fountain(data).encode('utf-8')
+        mime = "text/x-fountain"
+    elif format == ExportFormat.FINAL_DRAFT:
+        content = format_final_draft(data).encode('utf-8')
+        mime = "application/xml"
     elif format == ExportFormat.CSV:
         # Real CSV (audit F-15/P1-08): previously JSON bytes with a JSON
         # mime type. If the payload holds a top-level list of records
@@ -436,7 +628,7 @@ async def download_export(
     mime_type, b64 = file_url.split(";base64,", 1)
     mime_type = mime_type.replace("data:", "", 1) or "application/octet-stream"
     content = base64.b64decode(b64)
-    ext = {"application/json": "json", "text/markdown": "md", "text/plain": "txt", "text/csv": "csv"}.get(mime_type, "bin")
+    ext = {"application/json": "json", "text/markdown": "md", "text/plain": "txt", "text/csv": "csv", "text/x-fountain": "fountain", "application/xml": "fdx"}.get(mime_type, "bin")
     filename = f"export-{export_id}.{ext}"
     return FastAPIResponse(
         content=content,

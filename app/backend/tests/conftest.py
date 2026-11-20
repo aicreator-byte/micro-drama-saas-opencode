@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 import pytest
+import asyncio
 import pytest_asyncio
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
@@ -64,6 +65,18 @@ async def client(db_session):
     app.dependency_overrides[get_db] = override_get_db
     async with AsyncClient(app=app, base_url="http://test") as ac:
         yield ac
+    # Tunggu background task aplikasi selesai SEBELUM fixture DB
+    # di-teardown (FIX-ROUND2): endpoint auto-generate/video menjalankan
+    # job di asyncio.create_task. Tes yang hanya menunggu status job
+    # (polling/SSE) bisa kembali saat task masih commit audit/usage —
+    # bila loop ditutup saat itu, task dihancurkan di tengah transaksi
+    # dan greenlet-nya bocor ke fixture tes berikutnya (MissingGreenlet /
+    # IllegalStateChangeError di setup tes berikut, berpindah-pindah).
+    # Menunggu di sini (engine masih hidup) membuat suite deterministik.
+    current = asyncio.current_task()
+    pending = [t for t in asyncio.all_tasks() if t is not current and not t.done()]
+    if pending:
+        await asyncio.wait(pending, timeout=30)
     app.dependency_overrides.clear()
 
 

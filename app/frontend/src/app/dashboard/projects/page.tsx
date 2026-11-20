@@ -2,8 +2,9 @@
 
 import { useState, useEffect } from 'react';
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import { useProjectStore } from '@/store';
-import { projectsApi } from '@/lib/api';
+import { projectsApi, templatesApi } from '@/lib/api';
 import { Plus, Search, Filter, MoreVertical, Edit, Trash2, FolderOpen, Eye, X, FolderKanban } from 'lucide-react';
 import { ProjectStatus } from '@/types';
 import { cn, formatDate } from '@/lib/utils';
@@ -21,7 +22,16 @@ const projectSchema = z.object({
 
 type ProjectForm = z.infer<typeof projectSchema>;
 
+interface ProjectTemplate {
+  id: string;
+  name: string;
+  genre?: string | null;
+  description?: string | null;
+  total_episodes?: number | null;
+}
+
 export default function ProjectsPage() {
+  const router = useRouter();
   const { projects, setProjects, currentProject, setCurrentProject, addProject, updateProject, removeProject } = useProjectStore();
   const [isLoading, setIsLoading] = useState(true);
   const [search, setSearch] = useState('');
@@ -29,6 +39,13 @@ export default function ProjectsPage() {
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [editingProject, setEditingProject] = useState<typeof projects[0] | null>(null);
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
+  // Genre templates (GET /templates). Endpoint may not exist yet — on
+  // 404/503 the picker hides itself and manual creation keeps working.
+  const [templates, setTemplates] = useState<ProjectTemplate[]>([]);
+  const [templatesState, setTemplatesState] = useState<'idle' | 'loading' | 'ready' | 'unavailable'>('idle');
+  const [selectedTemplateId, setSelectedTemplateId] = useState('');
+  const [templateError, setTemplateError] = useState('');
+  const [templateCreating, setTemplateCreating] = useState(false);
 
   const {
     register,
@@ -57,6 +74,51 @@ export default function ProjectsPage() {
     };
     loadProjects();
   }, [setProjects]);
+
+  // Load genre templates when the create modal opens (create only).
+  useEffect(() => {
+    if (!showCreateModal || editingProject) return;
+    let cancelled = false;
+    setTemplatesState('loading');
+    setTemplateError('');
+    (async () => {
+      try {
+        const res = await templatesApi.list();
+        if (!cancelled) {
+          const list = Array.isArray(res.data) ? res.data : res.data?.templates ?? [];
+          setTemplates(list);
+          setTemplatesState('ready');
+        }
+      } catch {
+        if (!cancelled) setTemplatesState('unavailable');
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [showCreateModal, editingProject]);
+
+  const handleCreateFromTemplate = async () => {
+    if (!selectedTemplateId) return;
+    setTemplateCreating(true);
+    setTemplateError('');
+    try {
+      const res = await templatesApi.createFromTemplate({ template_id: selectedTemplateId });
+      const created = res.data;
+      if (created?.id) {
+        addProject(created);
+        reset();
+        setShowCreateModal(false);
+        router.push(`/projects/${created.id}`);
+      } else {
+        setTemplateError('Template created a project but returned no id.');
+      }
+    } catch (err: any) {
+      const detail = err.response?.data?.detail;
+      setTemplateError(typeof detail === 'string' ? detail : 'Failed to create project from template.');
+      console.error('Failed to create project from template:', err);
+    } finally {
+      setTemplateCreating(false);
+    }
+  };
 
   const onSubmit = async (data: ProjectForm) => {
     try {
@@ -355,6 +417,55 @@ export default function ProjectsPage() {
                 />
                 {errors.total_episodes && <p className="mt-1 text-sm text-red-600">{errors.total_episodes.message}</p>}
               </div>
+              {!editingProject && (
+                <div>
+                  <label htmlFor="template" className="label">Start from a genre template (optional)</label>
+                  {templatesState === 'loading' && (
+                    <p className="text-sm text-dark-500 dark:text-dark-400">Loading templates…</p>
+                  )}
+                  {templatesState === 'unavailable' && (
+                    <p className="text-sm text-dark-500 dark:text-dark-400">
+                      Templates belum tersedia — endpoint /templates belum aktif di backend. Buat proyek manual seperti biasa.
+                    </p>
+                  )}
+                  {templatesState === 'ready' && templates.length === 0 && (
+                    <p className="text-sm text-dark-500 dark:text-dark-400">No templates available yet.</p>
+                  )}
+                  {templatesState === 'ready' && templates.length > 0 && (
+                    <>
+                      <select
+                        id="template"
+                        value={selectedTemplateId}
+                        onChange={(e) => setSelectedTemplateId(e.target.value)}
+                        className="input"
+                      >
+                        <option value="">— No template (blank project) —</option>
+                        {templates.map((t) => (
+                          <option key={t.id} value={t.id}>
+                            {t.name}{t.genre ? ` — ${t.genre}` : ''}
+                          </option>
+                        ))}
+                      </select>
+                      {selectedTemplateId && (
+                        <div className="mt-2">
+                          <p className="text-sm text-dark-500 dark:text-dark-400">
+                            {templates.find((t) => t.id === selectedTemplateId)?.description || ''}
+                          </p>
+                          <button
+                            type="button"
+                            onClick={handleCreateFromTemplate}
+                            disabled={templateCreating}
+                            className="btn-primary mt-2"
+                          >
+                            {templateCreating ? 'Creating…' : 'Create Project from Template'}
+                          </button>
+                          {templateError && <p className="mt-1 text-sm text-red-600">{templateError}</p>}
+                        </div>
+                      )}
+                    </>
+                  )}
+                </div>
+              )}
               <div className="flex justify-end gap-3 pt-4">
                 <button
                   type="button"

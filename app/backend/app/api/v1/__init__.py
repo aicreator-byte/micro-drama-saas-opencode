@@ -1,4 +1,4 @@
-from app.api.v1 import auth, projects, series_bible, characters, locations, episodes, prompts, google_accounts, flow_bridge, audit_logs, story_engine, scene_engine, export, flow_bridge_automation, settings, auto_generate
+from app.api.v1 import auth, projects, series_bible, characters, locations, episodes, prompts, google_accounts, flow_bridge, audit_logs, story_engine, scene_engine, export, flow_bridge_automation, settings, auto_generate, analytics, assets, video, collab, billing, templates
 from fastapi import APIRouter
 
 api_router = APIRouter()
@@ -11,11 +11,17 @@ api_router.include_router(locations.router, prefix="/projects", tags=["Locations
 api_router.include_router(episodes.router, prefix="/projects", tags=["Episodes & Scenes"])
 api_router.include_router(prompts.router, prefix="/projects", tags=["Prompts"])
 api_router.include_router(google_accounts.router, prefix="/google-accounts", tags=["Google Accounts"])
+api_router.include_router(assets.router, prefix="/projects", tags=["Assets"])
 api_router.include_router(flow_bridge.router, prefix="/projects", tags=["Flow Bridge"])
 api_router.include_router(story_engine.router, prefix="/projects", tags=["Story Engine"])
 api_router.include_router(scene_engine.router, prefix="/projects", tags=["Scene Engine"])
 api_router.include_router(auto_generate.router, prefix="/projects", tags=["Auto Generate"])
+api_router.include_router(analytics.router, prefix="/projects", tags=["Analytics"])
 api_router.include_router(export.router, prefix="/projects", tags=["Export"])
+api_router.include_router(video.router, prefix="/projects", tags=["Video Pipeline"])
 api_router.include_router(flow_bridge_automation.router, prefix="/projects", tags=["Flow Bridge Automation"])
 api_router.include_router(audit_logs.router, prefix="/audit-logs", tags=["Audit Logs"])
 api_router.include_router(settings.router, prefix="", tags=["Settings"])
+api_router.include_router(collab.router, prefix="", tags=["Collaboration"])
+api_router.include_router(billing.router, prefix="/billing", tags=["Billing"])
+api_router.include_router(templates.router, prefix="", tags=["Templates"])

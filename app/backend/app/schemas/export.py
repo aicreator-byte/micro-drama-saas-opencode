@@ -10,6 +10,8 @@ class ExportFormat(str, Enum):
     CSV = "csv"
     PDF = "pdf"
     MARKDOWN = "markdown"
+    FOUNTAIN = "fountain"
+    FINAL_DRAFT = "fdx"
 
 
 class ExportType(str, Enum):

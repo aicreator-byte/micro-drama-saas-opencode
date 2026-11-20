@@ -4,9 +4,10 @@ Reads provider configuration from settings (DB), API keys from environment varia
 """
 import os
 import httpx
+import inspect
 import logging
 import json
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Callable, Awaitable, Union
 from dataclasses import dataclass
 from app.core.config import settings
 
@@ -50,10 +51,14 @@ class AIClient:
         temperature: float = 0.7,
         max_tokens: int = 4000,
         response_format: Optional[Dict[str, Any]] = None,
+        usage_sink: Optional[Callable[[AIResponse], Union[None, Awaitable[None]]]] = None,
     ) -> AIResponse:
         """
         Call chat completions with fallback across enabled providers.
         Raises AIClientError if all providers fail.
+        On success, usage_sink (if given) is called with the AIResponse so
+        the caller can record token usage; a failing sink is logged only
+        and never fails the call.
         """
         errors = []
 
@@ -74,6 +79,13 @@ class AIClient:
             try:
                 response = await self._call_provider(provider, api_key, messages, temperature, max_tokens, response_format)
                 logger.info(f"Successfully called provider {provider.id} ({provider.provider})")
+                if usage_sink is not None:
+                    try:
+                        _sink_result = usage_sink(response)
+                        if inspect.isawaitable(_sink_result):
+                            await _sink_result
+                    except Exception as sink_error:
+                        logger.warning(f"usage_sink failed (call still succeeded): {sink_error}")
                 return response
             except Exception as e:
                 error_info = {
@@ -149,6 +161,16 @@ class AIClient:
 
         content = data["choices"][0]["message"]["content"]
         usage = data.get("usage")
+        if isinstance(usage, dict):
+            # Normalise to ints where possible; keep the raw dict otherwise.
+            normalised = {}
+            for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                try:
+                    normalised[key] = int(usage[key])
+                except (KeyError, TypeError, ValueError):
+                    pass
+            if normalised:
+                usage = normalised
 
         return AIResponse(
             content=content,

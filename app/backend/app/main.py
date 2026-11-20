@@ -2,10 +2,11 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
+import asyncio
 import logging
 
 from app.core.config import settings
-from app.core.database import init_db
+from app.core.database import init_db, engine
 from app.api.v1 import api_router
 
 # Configure logging
@@ -19,6 +20,19 @@ async def lifespan(app: FastAPI):
     logger.info("Starting up Micro Drama SaaS...")
     await init_db()
     logger.info("Database initialized")
+    # Resume auto-generate jobs left RUNNING by a restart — in the
+    # background, never blocking startup; no-op when nothing is stale.
+    try:
+        from app.api.v1.auto_generate import resume_stale_jobs
+        asyncio.create_task(resume_stale_jobs(engine))
+    except Exception as exc:
+        logger.warning(f"Could not schedule stale-job resume: {exc}")
+    # Sama untuk VideoJob yang ditinggal pending/processing (P2-4 ronde 2).
+    try:
+        from app.api.v1.video import resume_stale_video_jobs
+        asyncio.create_task(resume_stale_video_jobs(engine))
+    except Exception as exc:
+        logger.warning(f"Could not schedule stale video-job resume: {exc}")
     yield
     # Shutdown
     logger.info("Shutting down Micro Drama SaaS...")

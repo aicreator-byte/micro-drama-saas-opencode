@@ -2,8 +2,8 @@
 
 import { useState, useEffect } from 'react';
 import { useAuthStore, useGoogleAccountStore } from '@/store';
-import { authApi, googleAccountsApi, projectsApi, settingsApi } from '@/lib/api';
-import { User, Mail, Lock, Key, Save, AlertCircle, CheckCircle, Plus, Trash2, Edit, ExternalLink, RefreshCw, Settings, Shield, Database, Cloud, Download, Cpu, Zap, GripVertical, Eye, EyeOff } from 'lucide-react';
+import { authApi, googleAccountsApi, projectsApi, settingsApi, billingApi } from '@/lib/api';
+import { User, Mail, Lock, Key, Save, AlertCircle, CheckCircle, Plus, Trash2, Edit, ExternalLink, RefreshCw, Settings, Shield, Database, Cloud, Download, Cpu, Zap, GripVertical, Eye, EyeOff, CreditCard } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useForm, useFieldArray } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
@@ -74,11 +74,72 @@ interface AppSettingsResponse {
 export default function SettingsPage() {
   const { user, token, updateUser } = useAuthStore();
   const { accounts, setAccounts, addAccount, updateAccount, removeAccount } = useGoogleAccountStore();
-  const [activeTab, setActiveTab] = useState<'profile' | 'security' | 'google' | 'ai-providers' | 'oauth' | 'data'>('profile');
+  const [activeTab, setActiveTab] = useState<'profile' | 'security' | 'google' | 'ai-providers' | 'oauth' | 'data' | 'billing'>('profile');
   const [isLoading, setIsLoading] = useState(false);
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [settings, setSettings] = useState<AppSettingsResponse | null>(null);
   const [showClientSecret, setShowClientSecret] = useState(false);
+
+  // Billing (GET /billing/subscription + /billing/plans). Endpoints may not
+  // exist yet — on 404/503 the tab shows "not configured (test mode)".
+  interface BillingPlan {
+    id: string;
+    name: string;
+    price?: number | null;
+    currency?: string | null;
+    interval?: string | null;
+    features?: string[];
+  }
+  interface BillingSubscription {
+    plan_id?: string | null;
+    plan_name?: string | null;
+    status?: string | null;
+    current_period_end?: string | null;
+    checkout_url?: string | null;
+  }
+  const [billing, setBilling] = useState<BillingSubscription | null>(null);
+  const [billingPlans, setBillingPlans] = useState<BillingPlan[]>([]);
+  const [billingState, setBillingState] = useState<'idle' | 'loading' | 'ready' | 'unavailable'>('idle');
+  const [billingError, setBillingError] = useState('');
+
+  useEffect(() => {
+    if (activeTab !== 'billing' || billingState !== 'idle') return;
+    let cancelled = false;
+    setBillingState('loading');
+    (async () => {
+      try {
+        const [subRes, plansRes] = await Promise.all([
+          billingApi.getSubscription(),
+          billingApi.listPlans(),
+        ]);
+        if (!cancelled) {
+          setBilling(subRes.data);
+          const list = Array.isArray(plansRes.data) ? plansRes.data : plansRes.data?.plans ?? [];
+          setBillingPlans(list);
+          setBillingState('ready');
+        }
+      } catch {
+        if (!cancelled) setBillingState('unavailable');
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [activeTab, billingState]);
+
+  const handleCheckout = async (planId: string) => {
+    setBillingError('');
+    try {
+      const res = await billingApi.createCheckout({ plan_id: planId });
+      const url = res.data?.checkout_url;
+      if (url) {
+        window.open(url, '_blank', 'noopener,noreferrer');
+      } else {
+        setBillingError('Billing belum dikonfigurasi (test mode) — server tidak mengembalikan checkout_url.');
+      }
+    } catch (err: any) {
+      const detail = err.response?.data?.detail;
+      setBillingError(typeof detail === 'string' ? detail : 'Billing belum dikonfigurasi (test mode).');
+    }
+  };
 
   const profileForm = useForm<ProfileForm>({
     resolver: zodResolver(profileSchema),
@@ -287,6 +348,7 @@ export default function SettingsPage() {
     { id: 'ai-providers', label: 'AI Providers', icon: Cpu },
     { id: 'oauth', label: 'OAuth Credentials', icon: Key },
     { id: 'data', label: 'Data & Privacy', icon: Database },
+    { id: 'billing', label: 'Billing', icon: CreditCard },
   ]
 
   return (
@@ -788,6 +850,79 @@ export default function SettingsPage() {
                   <Key className="w-4 h-4 mr-2" />
                   Manage API Tokens
                 </button>
+              </div>
+            </div>
+          )}
+
+          {activeTab === 'billing' && (
+            <div className="space-y-6">
+              <div className="card p-6">
+                <h3 className="font-medium text-dark-900 dark:text-white mb-4">Subscription</h3>
+                {billingState === 'loading' && (
+                  <p className="text-dark-500 dark:text-dark-400">Loading subscription…</p>
+                )}
+                {billingState === 'unavailable' && (
+                  <p className="text-dark-500 dark:text-dark-400">
+                    Billing belum dikonfigurasi (test mode) — endpoint /billing belum aktif di backend.
+                  </p>
+                )}
+                {billingState === 'ready' && (
+                  <div className="space-y-4">
+                    <dl className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      <div>
+                        <dt className="text-sm text-dark-500 dark:text-dark-400">Current plan</dt>
+                        <dd className="text-dark-900 dark:text-white font-medium">
+                          {billing?.plan_name || billing?.plan_id || 'Free'}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt className="text-sm text-dark-500 dark:text-dark-400">Status</dt>
+                        <dd className="text-dark-900 dark:text-white font-medium capitalize">
+                          {billing?.status || 'active'}
+                        </dd>
+                      </div>
+                      {billing?.current_period_end && (
+                        <div>
+                          <dt className="text-sm text-dark-500 dark:text-dark-400">Renews</dt>
+                          <dd className="text-dark-900 dark:text-white font-medium">
+                            {new Date(billing.current_period_end).toLocaleDateString()}
+                          </dd>
+                        </div>
+                      )}
+                    </dl>
+                    {billingPlans.length > 0 && (
+                      <div>
+                        <h4 className="text-sm font-medium text-dark-900 dark:text-white mb-2">Plans</h4>
+                        <ul className="space-y-2">
+                          {billingPlans.map((plan) => (
+                            <li key={plan.id} className="flex flex-wrap items-center justify-between gap-2 border border-dark-200 dark:border-dark-800 rounded-lg p-3">
+                              <div>
+                                <p className="font-medium text-dark-900 dark:text-white">{plan.name}</p>
+                                <p className="text-sm text-dark-500 dark:text-dark-400">
+                                  {plan.price != null ? `${plan.currency || 'USD'} ${plan.price}` : 'Free'}
+                                  {plan.interval ? ` / ${plan.interval}` : ''}
+                                </p>
+                              </div>
+                              <button
+                                onClick={() => handleCheckout(plan.id)}
+                                className="btn-primary text-sm"
+                              >
+                                Checkout
+                                <ExternalLink className="w-4 h-4 ml-2" />
+                              </button>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                    {billingError && (
+                      <p className="text-sm text-red-600 flex items-start gap-2">
+                        <AlertCircle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                        {billingError}
+                      </p>
+                    )}
+                  </div>
+                )}
               </div>
             </div>
           )}

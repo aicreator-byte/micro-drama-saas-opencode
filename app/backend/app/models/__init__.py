@@ -13,6 +13,12 @@ from app.models.audit_log import AuditLog, AuditAction
 from app.models.settings import AppSettings
 from app.models.dialogue import Dialogue
 from app.models.episode_revision import EpisodeRevision
+from app.models.subscription import Subscription
+from app.models.auto_generate import AutoGenerateJob, AutoGenerateStep
+from app.models.llm_usage import LlmUsageEvent
+from app.models.asset import Asset
+from app.models.video_job import VideoJob
+from app.models.checkout_session import CheckoutSession
 
 __all__ = [
     "User",
@@ -47,4 +53,11 @@ __all__ = [
     "AppSettings",
     "Dialogue",
     "EpisodeRevision",
+    "Subscription",
+    "AutoGenerateJob",
+    "AutoGenerateStep",
+    "LlmUsageEvent",
+    "Asset",
+    "VideoJob",
+    "CheckoutSession",
 ]

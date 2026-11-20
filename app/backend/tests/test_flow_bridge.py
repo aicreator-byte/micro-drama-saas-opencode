@@ -114,3 +114,30 @@ class TestFlowBridge:
         # User 2 should not access it
         response = await client.get(f"/api/v1/projects/{test_project.id}/tasks/{task_id}", headers=auth_headers2)
         assert response.status_code == 404
+    @pytest.mark.asyncio
+    async def test_list_project_flow_assets_moved_path(self, client: AsyncClient, auth_headers, test_project):
+        """Round 2: the FlowBridge project-assets list moved from
+        GET /projects/{id}/assets to /flow-assets, because /assets is
+        now the generic Asset Management list (assets.py). Both must
+        stay alive: FlowBridge list here, generic list empty (200)."""
+        task_response = await client.post(f"/api/v1/projects/{test_project.id}/tasks", json={
+            "title": "Test Task flow-assets",
+            "task_type": "video_generation",
+            "input_prompts": {"main": "Test"}
+        }, headers=auth_headers)
+        task_id = task_response.json()["id"]
+        await client.post(f"/api/v1/projects/{test_project.id}/tasks/{task_id}/assets", json={
+            "asset_type": "video_clip",
+            "title": "Video flow-assets",
+            "file_path": "/uploads/video-flow.mp4"
+        }, headers=auth_headers)
+
+        response = await client.get(f"/api/v1/projects/{test_project.id}/flow-assets", headers=auth_headers)
+        assert response.status_code == 200, response.text
+        data = response.json()
+        assert len(data) >= 1
+        assert any(a["title"] == "Video flow-assets" for a in data)
+
+        generic = await client.get(f"/api/v1/projects/{test_project.id}/assets", headers=auth_headers)
+        assert generic.status_code == 200, generic.text
+        assert generic.json() == []

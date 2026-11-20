@@ -10,9 +10,12 @@ number) and video prompts (by episode) are skipped.
 
 Steps run ASYNC: POST creates the job and returns 201 immediately with
 status RUNNING; the steps run in a background task on the same engine and
-GET polls the per-step status (live progress, audit O1). A job left
-RUNNING when the server restarts is NOT resumed automatically — poll the
-job and retry its failed step.
+GET polls the per-step status (live progress, audit O1) — or the client
+can follow GET .../stream (SSE) instead of polling. A job left RUNNING
+when the server restarts IS resumed automatically: resume_stale_jobs
+(runs at startup) re-queues it from the first step that is not COMPLETED,
+after resetting any step left RUNNING mid-flight back to PENDING (every
+step runner is idempotent, so re-running a half-finished step is safe).
 
 Reuses the existing Story Engine LLM helpers where they fit:
 - step 4 uses generate_story_outline_llm + apply_outline_episodes
@@ -27,15 +30,23 @@ No video is ever executed here (spec section 8): step 5 only writes
 VIDEO_GENERATION prompt rows for manual use in Google Flow.
 """
 import asyncio
-from fastapi import APIRouter, Depends, HTTPException, status, Request
+import logging
+import time
+from fastapi import APIRouter, Depends, HTTPException, Query, status, Request
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy import select
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Callable, Awaitable, Union
 from datetime import datetime, timezone
 import json
 
 from app.core.database import get_db
-from app.api.v1.auth import get_current_user, create_audit_log
+from app.api.v1.auth import get_current_user, get_current_user_optional, create_audit_log
+from app.core.security import (
+    create_stream_token,
+    decode_stream_token,
+    STREAM_TOKEN_EXPIRE_MINUTES,
+)
 from app.models.user import User
 from app.models.project import Project
 from app.models.series_bible import SeriesBible
@@ -57,7 +68,18 @@ from app.api.v1.story_engine import (
     generate_world_building_llm,
     apply_outline_episodes,
 )
-from app.services.ai_client import get_ai_client, AIClientError
+from app.services.ai_client import get_ai_client, AIClientError, AIResponse
+from app.services.llm_usage import (
+    make_buffered_usage_sink,
+    usage_sink_scope,
+    resolve_usage_sink,
+)
+
+logger = logging.getLogger(__name__)
+
+# SSE: give up after this long without the job reaching a terminal state.
+SSE_TIMEOUT_SECONDS = 120.0
+SSE_POLL_SECONDS = 0.5
 
 router = APIRouter()
 
@@ -107,9 +129,12 @@ def job_to_response(job: AutoGenerateJob) -> AutoGenerateJobResponse:
 
 async def _get_job_or_404(job_id: str, project_id: str, db: AsyncSession) -> AutoGenerateJob:
     result = await db.execute(
+        # populate_existing: a long-lived session (tests share one) may
+        # already hold this job with a stale status from before the
+        # background runner committed; force the row's values in.
         select(AutoGenerateJob).where(
             AutoGenerateJob.id == job_id, AutoGenerateJob.project_id == project_id
-        )
+        ).execution_options(populate_existing=True)
     )
     job = result.scalar_one_or_none()
     if not job:
@@ -142,7 +167,12 @@ def _llm_json(response_content: str) -> Dict[str, Any]:
     return output
 
 
-async def _chat_json(db: AsyncSession, prompt: str, max_tokens: int = 8000) -> Dict[str, Any]:
+async def _chat_json(
+    db: AsyncSession,
+    prompt: str,
+    max_tokens: int = 8000,
+    usage_sink: Optional[Callable[[AIResponse], Union[None, Awaitable[None]]]] = None,
+) -> Dict[str, Any]:
     """One chat_completion call that must return a JSON object."""
     ai_client = await get_ai_client(db)
     try:
@@ -154,10 +184,12 @@ async def _chat_json(db: AsyncSession, prompt: str, max_tokens: int = 8000) -> D
             temperature=0.7,
             max_tokens=max_tokens,
             response_format={"type": "json_object"},
+            usage_sink=resolve_usage_sink(usage_sink),
         )
     except AIClientError as e:
         raise HTTPException(status_code=502, detail=f"All AI providers failed: {e.errors}")
     return _llm_json(response.content)
+
 
 
 def _as_text(value: Any) -> Optional[str]:
@@ -552,11 +584,65 @@ async def _execute_steps(
 
     A failed step stops the job immediately; later steps stay pending.
     Completed steps are never re-run.
+    The run's LLM usage sink is set once here (ambient ContextVar), so
+    every LLM call inside the steps records one LlmUsageEvent without
+    changing any step's call shape.
+
+    Perbaikan P2-5 ronde 2: usage event dikumpulkan di sink buffer lalu
+    ditulis di transaksi TERPISAH SEBELUM status terminal (completed/
+    failed) di-commit — sebelumnya sink menulis di sesi yang sama dengan
+    step, sehingga rollback step yang gagal ikut menghapus event call
+    LLM-nya (biaya call yang gagal tetap terjadi tapi tidak tercatat).
+    Drain sebelum commit terminal juga menutup window race: penonton yang
+    melihat status terminal tidak bisa kembali saat drain masih jalan.
     """
     job.status = AutoGenerateJobStatus.RUNNING
     job.error_message = None
     await db.commit()
 
+    buffered_sink = make_buffered_usage_sink(
+        user.id, project_id=project.id, job_id=job.id
+    )
+    try:
+        with usage_sink_scope(buffered_sink.sink):
+            return await _execute_steps_inner(
+                db, job, project, user, from_step,
+                buffered_sink=buffered_sink,
+            )
+    finally:
+        # Jaring pengaman: drain sisa event bila inner keluar lewat jalur
+        # tak terduga (exception di luar step). Jalur normal sudah drain
+        # SEBELUM commit terminal di inner — drain di sini biasanya 0.
+        try:
+            await buffered_sink.drain(db.bind)
+        except Exception as exc:
+            logger.warning(f"usage drain failed for job {job.id}: {exc}")
+
+
+async def _drain_usage_before_terminal_commit(db, buffered_sink, job) -> None:
+    """Tulis event LLM yang terkumpul SEBELUM status terminal di-commit.
+
+    Penonton (polling/SSE) melihat status terminal sebagai "run selesai";
+    bila drain masih berjalan sesudahnya, teardown tes bisa menutup loop
+    di tengah drain (greenlet commit menggantung ke tes berikutnya).
+    Drain di sini tidak pernah menggagalkan job.
+    """
+    if buffered_sink is None:
+        return
+    try:
+        await buffered_sink.drain(db.bind)
+    except Exception as exc:
+        logger.warning(f"usage drain failed for job {job.id}: {exc}")
+
+
+async def _execute_steps_inner(
+    db: AsyncSession,
+    job: AutoGenerateJob,
+    project: Project,
+    user: User,
+    from_step: Optional[AutoGenerateStepName] = None,
+    buffered_sink=None,
+) -> AutoGenerateJob:
     from_order = STEP_ORDER.index(from_step) if from_step else 0
     steps = sorted(job.steps, key=lambda s: s.step_order)
     for step in steps:
@@ -582,6 +668,10 @@ async def _execute_steps(
             # a failed step must not leave half its rows behind), then mark
             # the step/job FAILED in a clean state and commit only that.
             await db.rollback()
+            # Drain SEBELUM commit FAILED: event call LLM step yang gagal
+            # tetap tercatat (P2-5), dan tidak ada kerja sesudah status
+            # terminal terlihat.
+            await _drain_usage_before_terminal_commit(db, buffered_sink, job)
             step.status = AutoGenerateStepStatus.FAILED
             step.error_message = detail
             step.completed_at = datetime.now(timezone.utc)
@@ -591,6 +681,7 @@ async def _execute_steps(
             return job
         except Exception as e:
             await db.rollback()
+            await _drain_usage_before_terminal_commit(db, buffered_sink, job)
             step.status = AutoGenerateStepStatus.FAILED
             step.error_message = str(e)
             step.completed_at = datetime.now(timezone.utc)
@@ -600,6 +691,7 @@ async def _execute_steps(
             return job
         await db.commit()
 
+    await _drain_usage_before_terminal_commit(db, buffered_sink, job)
     job.status = AutoGenerateJobStatus.COMPLETED
     job.completed_at = datetime.now(timezone.utc)
     await db.commit()
@@ -655,6 +747,84 @@ async def _run_job_in_background(
                     await session.commit()
         except Exception:
             pass
+
+
+async def resume_stale_jobs(engine) -> List[str]:
+    """Resume auto-generate jobs left RUNNING by a server restart.
+
+    For every RUNNING job: reset any step left RUNNING mid-flight back to
+    PENDING (every step runner is idempotent, so re-running it is safe),
+    then re-queue the job in the background from the first step that is
+    not COMPLETED. The job has no user_id of its own — the project's
+    owner_id is the user. Returns the ids of the jobs actually re-queued;
+    a job whose project is gone is skipped, never raised. No-op when
+    nothing is stale. Called once at startup (see app/main.py lifespan)
+    via create_task so it never blocks startup.
+    """
+    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    to_resume: List[Dict[str, Any]] = []
+    try:
+        async with factory() as session:
+            result = await session.execute(
+                select(AutoGenerateJob).where(
+                    AutoGenerateJob.status == AutoGenerateJobStatus.RUNNING
+                )
+            )
+            jobs = list(result.scalars().all())
+            for job in jobs:
+                await session.refresh(job, attribute_names=["steps"])
+                # A step interrupted mid-flight goes back to PENDING.
+                for step in job.steps:
+                    if step.status == AutoGenerateStepStatus.RUNNING:
+                        step.status = AutoGenerateStepStatus.PENDING
+                        step.error_message = None
+                # First step that still needs work (None = all done; the
+                # runner then just marks the job COMPLETED).
+                pending = next(
+                    (s for s in sorted(job.steps, key=lambda x: x.step_order)
+                     if s.status != AutoGenerateStepStatus.COMPLETED),
+                    None,
+                )
+                project_result = await session.execute(
+                    select(Project).where(Project.id == job.project_id)
+                )
+                project = project_result.scalar_one_or_none()
+                if project is None:
+                    logger.warning(
+                        f"resume_stale_jobs: skipping job {job.id}, project gone"
+                    )
+                    continue
+                to_resume.append({
+                    "job_id": job.id,
+                    "project_id": job.project_id,
+                    "owner_id": project.owner_id,
+                    "from_step": pending.step if pending is not None else None,
+                })
+                logger.info(
+                    "resume_stale_jobs: resuming job %s from step %s",
+                    job.id,
+                    pending.step.value if pending is not None else "none (all done)",
+                )
+            await session.commit()
+    except Exception as exc:
+        logger.warning(f"resume_stale_jobs failed: {exc}")
+        return []
+    # Schedule outside the session above: the runner opens its own.
+    scheduled: List[str] = []
+    for item in to_resume:
+        try:
+            asyncio.create_task(
+                _run_job_in_background(
+                    engine, item["job_id"], item["project_id"],
+                    item["owner_id"], from_step=item["from_step"],
+                )
+            )
+            scheduled.append(item["job_id"])
+        except Exception as exc:
+            logger.warning(
+                f"resume_stale_jobs: could not resume {item['job_id']}: {exc}"
+            )
+    return scheduled
 
 
 @router.post("/{project_id}/auto-generate", response_model=AutoGenerateJobResponse, status_code=status.HTTP_201_CREATED)
@@ -723,6 +893,118 @@ async def get_auto_generate_job(
     await get_project_or_404(project_id, current_user.id, db)
     job = await _get_job_or_404(job_id, project_id, db)
     return job_to_response(job)
+
+
+async def _resolve_stream_user(
+    request: Request, token: Optional[str], db: AsyncSession, job_id: str
+) -> User:
+    """Auth for the SSE stream.
+
+    Dua jalur (perbaikan P2-2 ronde 2):
+    - Header Authorization: JWT penuh seperti biasa (get_current_user).
+    - Query ?token=: HANYA token stream berumur pendek (purpose="sse",
+      terikat ke job ini, dibuat via POST .../stream-token). JWT penuh
+      lewat query DITOLAK — token berumur panjang tidak boleh lewat URL
+      (tercatat di access log / history browser / Referer).
+    """
+    user = await get_current_user_optional(request, db)
+    if user is not None:
+        return user
+    if token:
+        user_id = decode_stream_token(token, job_id)
+        if user_id:
+            result = await db.execute(select(User).where(User.id == user_id))
+            user = result.scalar_one_or_none()
+            if user is not None and user.is_active:
+                return user
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Not authenticated",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+@router.post("/{project_id}/auto-generate/{job_id}/stream-token")
+async def create_stream_token_endpoint(
+    project_id: str,
+    job_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Terbitkan token stream SSE berumur pendek untuk satu job.
+
+    Frontend memanggil ini (auth via header) sebelum membuka EventSource,
+    lalu membuka stream dengan ?token=<stream token>. Token berlaku 5
+    menit, hanya untuk job ini, hanya untuk membaca progres stream.
+    """
+    await get_project_or_404(project_id, current_user.id, db)
+    await _get_job_or_404(job_id, project_id, db)
+    token = create_stream_token(current_user.id, job_id)
+    return {
+        "stream_token": token,
+        "expires_in_seconds": STREAM_TOKEN_EXPIRE_MINUTES * 60,
+    }
+
+
+@router.get("/{project_id}/auto-generate/{job_id}/stream")
+async def stream_auto_generate_job(
+    project_id: str,
+    job_id: str,
+    request: Request,
+    token: Optional[str] = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+):
+    """Live progress as Server-Sent Events (replaces 2s GET polling).
+
+    Auth + project ownership are checked BEFORE the stream starts, so an
+    unknown job is a plain 404 and a missing token a plain 401. Every
+    ~0.5s a `progress` event carries the same JSON shape as
+    AutoGenerateJobResponse; when the job reaches a terminal state
+    (completed/failed) a `done` event is sent and the stream closes.
+    The stream also closes after 120s without a terminal state — the
+    client re-opens it (same job id, new stream token) or falls back to
+    GET polling (perbaikan P2-7 ronde 2: sebelumnya event `done`
+    timeout membuat UI berhenti total tanpa reconnect).
+
+    Token: ?token= hanya menerima token stream berumur pendek (POST
+    .../stream-token); JWT penuh hanya via header Authorization.
+    """
+    current_user = await _resolve_stream_user(request, token, db, job_id)
+    await get_project_or_404(project_id, current_user.id, db)
+    await _get_job_or_404(job_id, project_id, db)
+
+    async def event_generator():
+        # Poll through the REQUEST session (like GET polling does), not a
+        # fresh session per poll: with a single-connection test engine a
+        # second session's transaction can roll back / hide the runner's
+        # uncommitted work. _get_job_or_404 uses populate_existing, so
+        # these reads stay fresh even on a long-lived session.
+        deadline = time.monotonic() + SSE_TIMEOUT_SECONDS
+        while True:
+            try:
+                job = await _get_job_or_404(job_id, project_id, db)
+                payload = job_to_response(job).model_dump(mode="json")
+            except HTTPException:
+                yield 'event: done\ndata: {"status": "not_found"}\n\n'
+                return
+            except Exception as exc:  # transient read error: keep streaming
+                logger.warning(f"SSE poll failed for job {job_id}: {exc}")
+                payload = None
+            if payload is not None:
+                yield f"event: progress\ndata: {json.dumps(payload)}\n\n"
+                if payload["status"] in ("completed", "failed"):
+                    yield f"event: done\ndata: {json.dumps(payload)}\n\n"
+                    return
+            if time.monotonic() >= deadline:
+                yield 'event: done\ndata: {"status": "timeout"}\n\n'
+                return
+            await asyncio.sleep(SSE_POLL_SECONDS)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.post("/{project_id}/auto-generate/{job_id}/retry/{step}", response_model=AutoGenerateJobResponse)

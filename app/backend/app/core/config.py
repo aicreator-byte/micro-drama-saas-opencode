@@ -33,6 +33,16 @@ class Settings(BaseSettings):
     
     UPLOAD_DIR: str = "./uploads"
     MAX_FILE_SIZE: int = 100 * 1024 * 1024  # 100MB
+
+    # --- Asset storage (S3-compatible abstraction, default local) ---
+    ASSET_STORAGE_DIR: str = "./uploads/assets"
+    STORAGE_BACKEND: str = "local"  # "local" | "s3"
+    S3_ENDPOINT: str = ""
+    S3_BUCKET: str = ""
+    S3_ACCESS_KEY: str = ""
+    S3_SECRET_KEY: str = ""
+    S3_REGION: str = "us-east-1"
+    S3_CDN_BASE_URL: str = ""
     
     GOOGLE_ACCOUNTS_MAX_PER_USER: int = 20
 
@@ -66,6 +76,15 @@ class Settings(BaseSettings):
     # Ada di .env root (untuk frontend/docker-compose); dideklarasi juga
     # agar Settings tidak menolaknya (extra_forbidden).
     NEXT_PUBLIC_API_URL: str = ""
+
+    # --- Billing (Stripe, TEST MODE SAJA) ---
+    # Live key (sk_live_...) DITOLAK keras oleh StripeClient — Di tidak
+    # punya kartu kredit, jadi build ini tidak boleh menyentuh live mode.
+    STRIPE_SECRET_KEY: str = ""
+    STRIPE_WEBHOOK_SECRET: str = ""
+    STRIPE_PRICE_STARTER: str = ""
+    STRIPE_PRICE_PRO: str = ""
+    STRIPE_PRICE_STUDIO: str = ""
 
     class Config:
         env_file = _ENV_FILES

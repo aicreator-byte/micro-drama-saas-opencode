@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { 
@@ -13,7 +13,7 @@ import {
   Image, Zap, Layers, Type, Palette,
   BookOpen, Target, Sparkles
 } from 'lucide-react';
-import { api, exportApi, flowBridgeApi, storyEngineApi, sceneEngineApi, autoGenerateApi } from '@/lib/api';
+import { api, exportApi, flowBridgeApi, storyEngineApi, sceneEngineApi, autoGenerateApi, analyticsApi } from '@/lib/api';
 import { useAuthStore } from '@/store';
 import { formatDate } from '@/lib/utils';
 
@@ -283,8 +283,10 @@ export default function ProjectPage() {
   // Auto-Generate (spec §6) — one job, 5 steps.
   // The backend runs jobs ASYNC: POST creates the job and returns 201 with
   // status RUNNING; the steps run in a background task. While the modal is
-  // open and the job is still running, the page polls GET every 2s for the
-  // live per-step status, and refreshes the tab data when the job completes.
+  // open and the job is still running, the page subscribes to the SSE
+  // stream (GET .../auto-generate/{job_id}/stream) for live per-step
+  // status, falling back to 2s GET polling if the stream is unavailable,
+  // and refreshes the tab data when the job completes.
   const AUTO_GENERATE_STEP_LABELS: Record<string, string> = {
     series_bible: 'Series Bible',
     characters: 'Characters',
@@ -304,6 +306,42 @@ export default function ProjectPage() {
   const [autoGenSubmitting, setAutoGenSubmitting] = useState(false);
   const [autoGenRetrying, setAutoGenRetrying] = useState<string | null>(null);
   const [autoGenError, setAutoGenError] = useState('');
+  // 'sse' while the EventSource stream is live, 'polling' after falling
+  // back, null before any subscription. Shown in the modal header.
+  const [autoGenStreamMode, setAutoGenStreamMode] = useState<'sse' | 'polling' | null>(null);
+  const autoGenJobRef = useRef<AutoGenerateJob | null>(null);
+  autoGenJobRef.current = autoGenJob;
+
+  // Project analytics (GET /projects/{id}/analytics/summary). The endpoint
+  // may not exist yet — on 404/503 the panel shows "not available" and the
+  // rest of the page keeps working.
+  interface AnalyticsSummary {
+    total_tokens?: number;
+    estimated_cost_usd?: number | null;
+    estimated_cost?: number | null;
+    currency?: string;
+    by_model?: Array<{ model: string; tokens: number; estimated_cost_usd?: number | null }>;
+  }
+  const [analytics, setAnalytics] = useState<AnalyticsSummary | null>(null);
+  const [analyticsState, setAnalyticsState] = useState<'loading' | 'ready' | 'unavailable'>('loading');
+
+  useEffect(() => {
+    if (activeTab !== 'overview' || !projectId) return;
+    let cancelled = false;
+    (async () => {
+      setAnalyticsState('loading');
+      try {
+        const res = await analyticsApi.getProjectSummary(projectId);
+        if (!cancelled) {
+          setAnalytics(res.data);
+          setAnalyticsState('ready');
+        }
+      } catch {
+        if (!cancelled) setAnalyticsState('unavailable');
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [activeTab, projectId]);
 
   // Series Bible
   const [seriesBible, setSeriesBible] = useState<SeriesBible | null>(null);
@@ -1253,23 +1291,130 @@ export default function ProjectPage() {
     setActiveTab(tab);
   };
 
-  // Live progress: poll the running job every 2s while the modal is open.
-  // Stops by itself once the job is completed/failed; on completion the
-  // tab data is refreshed so the new rows show up without a manual reload.
+  // Live progress: SSE stream first, polling fallback.
+  // EventSource cannot send an Authorization header, so auth goes via
+  // ?token=<stream token> — a short-lived (5 min), single-job token from
+  // POST .../stream-token, NOT the full JWT (see autoGenerateApi). If the
+  // stream endpoint does not exist yet (404/503) or the connection errors,
+  // the code falls back to the old 2s GET polling and keeps it until the
+  // job is terminal. If the stream times out after 120s without a
+  // terminal state, it re-opens (max 5x) before falling back to polling.
+  // Effect is keyed on job id only (not the job object) so a `progress`
+  // event does not tear down and re-open the stream on every update.
   useEffect(() => {
     if (!showAutoGenerateModal || !autoGenJob) return;
     if (autoGenJob.status === 'completed' || autoGenJob.status === 'failed') return;
-    const timer = setInterval(async () => {
+    let eventSource: EventSource | null = null;
+    let pollTimer: ReturnType<typeof setInterval> | null = null;
+    let stopped = false;
+
+    const applyJobUpdate = (data: AutoGenerateJob) => {
+      setAutoGenJob(data);
+      if (data.status === 'completed') refreshAutoGenData();
+    };
+
+    const startPolling = () => {
+      if (stopped || pollTimer) return;
+      setAutoGenStreamMode('polling');
+      pollTimer = setInterval(async () => {
+        const job = autoGenJobRef.current;
+        if (!job) return;
+        try {
+          const response = await autoGenerateApi.get(projectId, job.id);
+          applyJobUpdate(response.data);
+          if (response.data.status === 'completed' || response.data.status === 'failed') {
+            if (pollTimer) clearInterval(pollTimer);
+          }
+        } catch (err) {
+          console.error('Failed to poll auto-generate job:', err);
+        }
+      }, 2000);
+    };
+
+    // SSE reconnect (perbaikan P2-7 ronde 2): stream menutup setelah 120
+    // dtk tanpa status terminal (`done` {"status":"timeout"}). Sebelumnya
+    // handler `done` menutup stream begitu saja — UI berhenti total.
+    // Kini timeout membuka ulang stream (maks 5x, jeda 1 dtk); bila masih
+    // belum terminal, jatuh ke polling 2 dtk. `done` terminal
+    // (completed/failed) tetap menutup stream seperti dulu.
+    const MAX_SSE_RECONNECTS = 5;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const openStream = async (attempt: number) => {
+      if (stopped) return;
+      let streamToken: string;
       try {
-        const response = await autoGenerateApi.get(projectId, autoGenJob.id);
-        setAutoGenJob(response.data);
-        if (response.data.status === 'completed') refreshAutoGenData();
+        const response = await autoGenerateApi.streamToken(projectId, autoGenJob.id);
+        streamToken = response.data.stream_token as string;
       } catch (err) {
-        console.error('Failed to poll auto-generate job:', err);
+        console.error('Failed to get auto-generate stream token:', err);
+        if (!stopped) startPolling();
+        return;
       }
-    }, 2000);
-    return () => clearInterval(timer);
-  }, [showAutoGenerateModal, autoGenJob, projectId]);
+      if (stopped) return;
+      try {
+        setAutoGenStreamMode('sse');
+        eventSource = new EventSource(autoGenerateApi.streamUrl(projectId, autoGenJob.id, streamToken));
+        eventSource.addEventListener('progress', (e) => {
+          try {
+            applyJobUpdate(JSON.parse((e as MessageEvent).data));
+          } catch (err) {
+            console.error('Failed to parse auto-generate progress event:', err);
+          }
+        });
+        eventSource.addEventListener('done', (e) => {
+          let payload: { status?: string } | null = null;
+          try {
+            if ((e as MessageEvent).data) payload = JSON.parse((e as MessageEvent).data);
+          } catch (err) {
+            console.error('Failed to parse auto-generate done event:', err);
+          }
+          eventSource?.close();
+          eventSource = null;
+          if (stopped) return;
+          if (payload && (payload.status === 'completed' || payload.status === 'failed')) {
+            applyJobUpdate(payload as AutoGenerateJob);
+          } else if (payload && payload.status === 'timeout') {
+            if (attempt < MAX_SSE_RECONNECTS) {
+              reconnectTimer = setTimeout(() => { void openStream(attempt + 1); }, 1000);
+            } else {
+              startPolling();
+            }
+          } else {
+            // Job hilang di tengah stream atau payload tak dikenal:
+            // polling sampai status terminal.
+            startPolling();
+          }
+        });
+        eventSource.onerror = () => {
+          // Stream endpoint missing (404), token rejected, or connection
+          // dropped: close and fall back to polling instead of retrying
+          // the EventSource forever.
+          eventSource?.close();
+          eventSource = null;
+          if (!stopped) startPolling();
+        };
+      } catch (err) {
+        console.error('Failed to open auto-generate SSE stream:', err);
+        if (!stopped) startPolling();
+      }
+    };
+
+    const token = typeof window !== 'undefined' ? localStorage.getItem('access_token') : null;
+    if (!token) {
+      startPolling();
+    } else {
+      void openStream(0);
+    }
+
+    return () => {
+      stopped = true;
+      eventSource?.close();
+      if (pollTimer) clearInterval(pollTimer);
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showAutoGenerateModal, autoGenJob?.id, projectId]);
 
   if (!isAuthenticated || isLoading) {
     return (
@@ -1320,6 +1465,58 @@ export default function ProjectPage() {
                   <dd className="text-slate-900 dark:text-white">{formatDate(project.updated_at)}</dd>
                 </div>
               </dl>
+            </div>
+
+            {/* Analytics — token usage & estimated cost for this project */}
+            <div className="card">
+              <h2 className="text-lg font-semibold text-slate-900 dark:text-white mb-1">Analytics</h2>
+              <p className="text-xs text-slate-500 dark:text-slate-400 mb-4">Token usage and cost for this project. All costs are estimates.</p>
+              {analyticsState === 'loading' && (
+                <p className="text-sm text-slate-500 dark:text-slate-400 flex items-center gap-2">
+                  <Loader2 className="w-4 h-4 animate-spin" /> Loading analytics…
+                </p>
+              )}
+              {analyticsState === 'unavailable' && (
+                <p className="text-sm text-slate-500 dark:text-slate-400">
+                  Analytics belum tersedia — endpoint /analytics/summary belum aktif di backend.
+                </p>
+              )}
+              {analyticsState === 'ready' && analytics && (
+                <div className="space-y-4">
+                  <dl className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div>
+                      <dt className="text-sm text-slate-500 dark:text-slate-400">Total tokens</dt>
+                      <dd className="text-slate-900 dark:text-white font-medium">
+                        {(analytics.total_tokens ?? 0).toLocaleString()}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt className="text-sm text-slate-500 dark:text-slate-400">Estimated cost (estimasi)</dt>
+                      <dd className="text-slate-900 dark:text-white font-medium">
+                        {analytics.estimated_cost_usd != null || analytics.estimated_cost != null
+                          ? `$${(analytics.estimated_cost_usd ?? analytics.estimated_cost ?? 0).toFixed(4)}`
+                          : '—'}
+                      </dd>
+                    </div>
+                  </dl>
+                  {analytics.by_model && analytics.by_model.length > 0 && (
+                    <div>
+                      <h3 className="text-sm font-medium text-slate-900 dark:text-white mb-2">Per model</h3>
+                      <ul className="space-y-1">
+                        {analytics.by_model.map((m) => (
+                          <li key={m.model} className="flex items-center justify-between text-sm">
+                            <span className="text-slate-600 dark:text-slate-300 break-all">{m.model}</span>
+                            <span className="text-slate-900 dark:text-white whitespace-nowrap ml-4">
+                              {m.tokens.toLocaleString()} tokens
+                              {m.estimated_cost_usd != null && ` · $${m.estimated_cost_usd.toFixed(4)} (estimasi)`}
+                            </span>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
             
             {project.description && (
@@ -2474,6 +2671,10 @@ export default function ProjectPage() {
                 <Edit className="w-4 h-4 mr-2" />
                 Edit
               </button>
+              <Link href={`/projects/${projectId}/collab`} className="btn-secondary" title="Real-time collaboration: presence + edit Series Bible bersama (owner-only, single-worker)">
+                <Users className="w-4 h-4 mr-2" />
+                Collaboration
+              </Link>
               <button onClick={openAutoGenerateModal} className="btn-primary" title="Generate the whole project with AI: bible, characters, locations, episodes and prompts">
                 <Sparkles className="w-4 h-4 mr-2" />
                 Auto-Generate
@@ -2625,6 +2826,11 @@ export default function ProjectPage() {
                       autoGenJob.status === 'failed' ? 'bg-red-100 text-red-800' :
                       'bg-blue-100 text-blue-800'
                     }`}>{autoGenJob.status}</span>
+                    {autoGenStreamMode && autoGenJob.status !== 'completed' && autoGenJob.status !== 'failed' && (
+                      <span className="text-xs text-slate-400 dark:text-slate-500" title={autoGenStreamMode === 'sse' ? 'Live updates via server-sent events' : 'Live updates via polling (SSE stream unavailable)'}>
+                        {autoGenStreamMode === 'sse' ? '● live (SSE)' : '● live (polling)'}
+                      </span>
+                    )}
                   </div>
 
                   {autoGenError && (

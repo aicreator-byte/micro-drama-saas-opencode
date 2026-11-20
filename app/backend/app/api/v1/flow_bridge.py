@@ -601,7 +601,11 @@ async def list_flow_assets(
     return assets
 
 
-@router.get("/{project_id}/assets", response_model=List[FlowBridgeAssetResponse])
+# NOTE (round 2): path is /flow-assets, NOT /assets — GET
+# /projects/{id}/assets is the generic Asset Management list (assets.py
+# router, registered first). Both lists stay alive; the frontend
+# flowBridgeApi.listProjectAssets calls this /flow-assets path.
+@router.get("/{project_id}/flow-assets", response_model=List[FlowBridgeAssetResponse])
 async def list_project_assets(
     project_id: str,
     request: Request,

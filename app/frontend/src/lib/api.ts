@@ -2,6 +2,8 @@ import axios, { AxiosError, InternalAxiosRequestConfig } from 'axios';
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api/v1';
 
+export { API_BASE_URL };
+
 export const api = axios.create({
   baseURL: API_BASE_URL,
   headers: {
@@ -255,7 +257,7 @@ export const flowBridgeApi = {
     api.post(`/projects/${projectId}/tasks/${taskId}/assets`, data),
   
   listProjectAssets: (projectId: string, params?: { asset_type?: string; episode_id?: string }) =>
-    api.get(`/projects/${projectId}/assets`, { params }),
+    api.get(`/projects/${projectId}/flow-assets`, { params }),
 };
 
 // Audit Logs API
@@ -321,6 +323,59 @@ export const autoGenerateApi = {
 
   retry: (projectId: string, jobId: string, step: string) =>
     api.post(`/projects/${projectId}/auto-generate/${jobId}/retry/${step}`),
+
+  // SSE stream URL (contract): GET /projects/{id}/auto-generate/{job_id}/stream
+  // returns text/event-stream; `progress` events carry the same JSON as GET
+  // job, `done` fires when the job is terminal and the stream then closes.
+  // EventSource cannot send headers, so auth goes via ?token=<stream token>:
+  // a short-lived (5 min), single-job token from streamToken() below — the
+  // full JWT must NEVER go in the URL (it lands in access logs, browser
+  // history, and the Referer header). The backend rejects full JWTs in
+  // ?token= with 401.
+  streamToken: (projectId: string, jobId: string) =>
+    api.post(`/projects/${projectId}/auto-generate/${jobId}/stream-token`),
+
+  streamUrl: (projectId: string, jobId: string, token: string) =>
+    `${API_BASE_URL}/projects/${projectId}/auto-generate/${jobId}/stream?token=${encodeURIComponent(token)}`,
+};
+
+// Collaboration API: presence + bible patch (REST fallback when the
+// WebSocket room is unavailable). Room is owner-only, single-worker
+// (see backend app/api/v1/collab.py for the documented limits).
+export const collabApi = {
+  presence: (projectId: string) =>
+    api.get(`/projects/${projectId}/collab/presence`),
+
+  patch: (projectId: string, field: string, value: string) =>
+    api.post(`/projects/${projectId}/collab/patch`, { field, value }),
+};
+
+// Project Templates API (backend endpoint may not exist yet — every call
+// site must tolerate 404/503 and keep the UI working).
+export const templatesApi = {
+  list: () =>
+    api.get('/templates'),
+
+  createFromTemplate: (data: { template_id: string; title?: string; total_episodes?: number }) =>
+    api.post('/projects/from-template', data),
+};
+
+// Billing API (Stripe-backed; backend endpoint may not exist yet).
+export const billingApi = {
+  getSubscription: () =>
+    api.get('/billing/subscription'),
+
+  listPlans: () =>
+    api.get('/billing/plans'),
+
+  createCheckout: (data: { plan_id: string }) =>
+    api.post('/billing/checkout', data),
+};
+
+// Analytics API (backend endpoint may not exist yet).
+export const analyticsApi = {
+  getProjectSummary: (projectId: string) =>
+    api.get(`/projects/${projectId}/analytics/summary`),
 };
 
 // Scene Engine API

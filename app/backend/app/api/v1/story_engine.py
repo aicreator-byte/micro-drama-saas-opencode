@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Callable, Awaitable, Union
 from datetime import datetime, timezone
 import json
 
@@ -20,7 +20,8 @@ from app.schemas.story_engine import (
     StoryOutlineResponse, CharacterArcResponse, WorldBuildingResponse,
     RefineStoryRequest, RefineStoryResponse
 )
-from app.services.ai_client import get_ai_client, AIClientError
+from app.services.ai_client import get_ai_client, AIClientError, AIResponse
+from app.services.llm_usage import make_usage_sink, resolve_usage_sink
 
 router = APIRouter()
 
@@ -261,7 +262,7 @@ Character focus should list 2-3 main characters for this episode.
 Return ONLY valid JSON, no markdown formatting."""
 
 
-async def generate_story_outline_llm(db: AsyncSession, project_id: str, series_bible: SeriesBible, parameters: Dict[str, Any] = None, user_context: Optional[str] = None) -> Dict[str, Any]:
+async def generate_story_outline_llm(db: AsyncSession, project_id: str, series_bible: SeriesBible, parameters: Dict[str, Any] = None, user_context: Optional[str] = None, usage_sink: Optional[Callable[[AIResponse], Union[None, Awaitable[None]]]] = None) -> Dict[str, Any]:
     """Generate story outline using real LLM."""
     total_episodes = parameters.get("total_episodes", 20) if parameters else 20
 
@@ -279,7 +280,8 @@ async def generate_story_outline_llm(db: AsyncSession, project_id: str, series_b
             ],
             temperature=0.7,
             max_tokens=8000,
-            response_format={"type": "json_object"}
+            response_format={"type": "json_object"},
+            usage_sink=resolve_usage_sink(usage_sink)
         )
         output = json.loads(response.content)
         output["generated_at"] = datetime.now(timezone.utc).isoformat()
@@ -290,7 +292,7 @@ async def generate_story_outline_llm(db: AsyncSession, project_id: str, series_b
         raise HTTPException(status_code=502, detail=f"Invalid JSON from AI: {e}")
 
 
-async def generate_single_episode_llm(db: AsyncSession, project_id: str, series_bible: SeriesBible, parameters: Dict[str, Any] = None, user_context: Optional[str] = None) -> Dict[str, Any]:
+async def generate_single_episode_llm(db: AsyncSession, project_id: str, series_bible: SeriesBible, parameters: Dict[str, Any] = None, user_context: Optional[str] = None, usage_sink: Optional[Callable[[AIResponse], Union[None, Awaitable[None]]]] = None) -> Dict[str, Any]:
     """Generate a single episode outline using real LLM (GENERATE_EPISODE)."""
     episode_number = 1
     if parameters:
@@ -313,7 +315,8 @@ async def generate_single_episode_llm(db: AsyncSession, project_id: str, series_
             ],
             temperature=0.7,
             max_tokens=8000,
-            response_format={"type": "json_object"}
+            response_format={"type": "json_object"},
+            usage_sink=resolve_usage_sink(usage_sink)
         )
         output = json.loads(response.content)
         output["generated_at"] = datetime.now(timezone.utc).isoformat()
@@ -324,7 +327,7 @@ async def generate_single_episode_llm(db: AsyncSession, project_id: str, series_
         raise HTTPException(status_code=502, detail=f"Invalid JSON from AI: {e}")
 
 
-async def generate_character_arcs_llm(db: AsyncSession, project_id: str, series_bible: SeriesBible, parameters: Dict[str, Any] = None) -> Dict[str, Any]:
+async def generate_character_arcs_llm(db: AsyncSession, project_id: str, series_bible: SeriesBible, parameters: Dict[str, Any] = None, usage_sink: Optional[Callable[[AIResponse], Union[None, Awaitable[None]]]] = None) -> Dict[str, Any]:
     """Generate character arcs using real LLM."""
     result = await db.execute(select(Character).where(Character.project_id == project_id))
     characters = result.scalars().all()
@@ -340,7 +343,8 @@ async def generate_character_arcs_llm(db: AsyncSession, project_id: str, series_
             ],
             temperature=0.7,
             max_tokens=8000,
-            response_format={"type": "json_object"}
+            response_format={"type": "json_object"},
+            usage_sink=resolve_usage_sink(usage_sink)
         )
         output = json.loads(response.content)
         output["generated_at"] = datetime.now(timezone.utc).isoformat()
@@ -351,7 +355,7 @@ async def generate_character_arcs_llm(db: AsyncSession, project_id: str, series_
         raise HTTPException(status_code=502, detail=f"Invalid JSON from AI: {e}")
 
 
-async def generate_world_building_llm(db: AsyncSession, project_id: str, series_bible: SeriesBible, parameters: Dict[str, Any] = None) -> Dict[str, Any]:
+async def generate_world_building_llm(db: AsyncSession, project_id: str, series_bible: SeriesBible, parameters: Dict[str, Any] = None, usage_sink: Optional[Callable[[AIResponse], Union[None, Awaitable[None]]]] = None) -> Dict[str, Any]:
     """Generate world building using real LLM."""
     result = await db.execute(select(Location).where(Location.project_id == project_id))
     locations = result.scalars().all()
@@ -370,7 +374,8 @@ async def generate_world_building_llm(db: AsyncSession, project_id: str, series_
             ],
             temperature=0.7,
             max_tokens=8000,
-            response_format={"type": "json_object"}
+            response_format={"type": "json_object"},
+            usage_sink=resolve_usage_sink(usage_sink)
         )
         output = json.loads(response.content)
         output["generated_at"] = datetime.now(timezone.utc).isoformat()
@@ -381,7 +386,7 @@ async def generate_world_building_llm(db: AsyncSession, project_id: str, series_
         raise HTTPException(status_code=502, detail=f"Invalid JSON from AI: {e}")
 
 
-async def refine_story_output_llm(db: AsyncSession, task: StoryEngineTask, feedback: str, refine_type: str) -> Dict[str, Any]:
+async def refine_story_output_llm(db: AsyncSession, task: StoryEngineTask, feedback: str, refine_type: str, usage_sink: Optional[Callable[[AIResponse], Union[None, Awaitable[None]]]] = None) -> Dict[str, Any]:
     """Refine story output using real LLM."""
     ai_client = await get_ai_client(db)
     prompt = build_refine_prompt(task.output or {}, feedback, refine_type)
@@ -394,7 +399,8 @@ async def refine_story_output_llm(db: AsyncSession, task: StoryEngineTask, feedb
             ],
             temperature=0.5,
             max_tokens=8000,
-            response_format={"type": "json_object"}
+            response_format={"type": "json_object"},
+            usage_sink=resolve_usage_sink(usage_sink)
         )
         output = json.loads(response.content)
         output["refined_at"] = datetime.now(timezone.utc).isoformat()
@@ -470,19 +476,20 @@ async def execute_story_task(
     # Update status to processing
     task.status = StoryEngineTaskStatus.PROCESSING
     await db.commit()
-    
+    usage_sink = make_usage_sink(db, current_user.id, project_id=project_id)
+
     try:
         # Execute based on task type
         if task.task_type == StoryEngineTaskType.GENERATE_OUTLINE:
-            output = await generate_story_outline_llm(db, project_id, series_bible, task.input_parameters, task.context)
+            output = await generate_story_outline_llm(db, project_id, series_bible, task.input_parameters, task.context, usage_sink=usage_sink)
         elif task.task_type == StoryEngineTaskType.GENERATE_EPISODE:
-            output = await generate_single_episode_llm(db, project_id, series_bible, task.input_parameters, task.context)
+            output = await generate_single_episode_llm(db, project_id, series_bible, task.input_parameters, task.context, usage_sink=usage_sink)
         elif task.task_type == StoryEngineTaskType.GENERATE_CHARACTER_ARCS:
-            output = await generate_character_arcs_llm(db, project_id, series_bible, task.input_parameters)
+            output = await generate_character_arcs_llm(db, project_id, series_bible, task.input_parameters, usage_sink=usage_sink)
         elif task.task_type == StoryEngineTaskType.GENERATE_WORLD_BUILDING:
-            output = await generate_world_building_llm(db, project_id, series_bible, task.input_parameters)
+            output = await generate_world_building_llm(db, project_id, series_bible, task.input_parameters, usage_sink=usage_sink)
         elif task.task_type == StoryEngineTaskType.REFINE_STORY:
-            output = await refine_story_output_llm(db, task, task.context or "", "general")
+            output = await refine_story_output_llm(db, task, task.context or "", "general", usage_sink=usage_sink)
         else:
             raise ValueError(f"Unknown task type: {task.task_type}")
         
@@ -622,7 +629,8 @@ async def refine_story_task(
     if task.status != StoryEngineTaskStatus.COMPLETED:
         raise HTTPException(status_code=400, detail="Can only refine completed tasks")
     
-    refined = await refine_story_output_llm(db, task, refine_data.feedback, refine_data.refine_type)
+    refined = await refine_story_output_llm(db, task, refine_data.feedback, refine_data.refine_type,
+        usage_sink=make_usage_sink(db, current_user.id, project_id=project_id))
     
     # Create new task for refinement
     new_task = StoryEngineTask(

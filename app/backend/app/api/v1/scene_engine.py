@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Callable, Awaitable, Union
 from datetime import datetime, timezone
 import json
 
@@ -19,7 +19,8 @@ from app.schemas.scene_engine import (
     EpisodeBreakdownResponse, ShotBreakdown, SceneShotsResponse,
     DialogueResponse, ActionResponse, RefineSceneRequest, RefineSceneResponse
 )
-from app.services.ai_client import get_ai_client, AIClientError
+from app.services.ai_client import get_ai_client, AIClientError, AIResponse
+from app.services.llm_usage import make_usage_sink, resolve_usage_sink
 
 router = APIRouter()
 
@@ -301,7 +302,7 @@ Generate a JSON response with this exact structure:
 Return ONLY valid JSON, no markdown formatting."""
 
 
-async def generate_episode_breakdown_llm(db: AsyncSession, project_id: str, episode: Episode, parameters: Dict[str, Any] = None) -> Dict[str, Any]:
+async def generate_episode_breakdown_llm(db: AsyncSession, project_id: str, episode: Episode, parameters: Dict[str, Any] = None, usage_sink: Optional[Callable[[AIResponse], Union[None, Awaitable[None]]]] = None) -> Dict[str, Any]:
     """Generate episode breakdown using real LLM."""
     total_scenes = parameters.get("total_scenes", 8) if parameters else 8
     
@@ -322,7 +323,8 @@ async def generate_episode_breakdown_llm(db: AsyncSession, project_id: str, epis
             ],
             temperature=0.7,
             max_tokens=8000,
-            response_format={"type": "json_object"}
+            response_format={"type": "json_object"},
+            usage_sink=resolve_usage_sink(usage_sink)
         )
         output = json.loads(response.content)
         output["generated_at"] = datetime.now(timezone.utc).isoformat()
@@ -333,7 +335,7 @@ async def generate_episode_breakdown_llm(db: AsyncSession, project_id: str, epis
         raise HTTPException(status_code=502, detail=f"Invalid JSON from AI: {e}")
 
 
-async def generate_scene_shots_llm(db: AsyncSession, project_id: str, scene: Scene, parameters: Dict[str, Any] = None) -> Dict[str, Any]:
+async def generate_scene_shots_llm(db: AsyncSession, project_id: str, scene: Scene, parameters: Dict[str, Any] = None, usage_sink: Optional[Callable[[AIResponse], Union[None, Awaitable[None]]]] = None) -> Dict[str, Any]:
     """Generate shot list using real LLM."""
     total_shots = parameters.get("total_shots", 12) if parameters else 12
     
@@ -355,7 +357,8 @@ async def generate_scene_shots_llm(db: AsyncSession, project_id: str, scene: Sce
             ],
             temperature=0.7,
             max_tokens=8000,
-            response_format={"type": "json_object"}
+            response_format={"type": "json_object"},
+            usage_sink=resolve_usage_sink(usage_sink)
         )
         output = json.loads(response.content)
         output["generated_at"] = datetime.now(timezone.utc).isoformat()
@@ -366,7 +369,7 @@ async def generate_scene_shots_llm(db: AsyncSession, project_id: str, scene: Sce
         raise HTTPException(status_code=502, detail=f"Invalid JSON from AI: {e}")
 
 
-async def generate_dialogue_llm(db: AsyncSession, project_id: str, scene: Scene, parameters: Dict[str, Any] = None) -> Dict[str, Any]:
+async def generate_dialogue_llm(db: AsyncSession, project_id: str, scene: Scene, parameters: Dict[str, Any] = None, usage_sink: Optional[Callable[[AIResponse], Union[None, Awaitable[None]]]] = None) -> Dict[str, Any]:
     """Generate dialogue using real LLM."""
     char_result = await db.execute(select(Character).where(Character.project_id == project_id))
     characters = char_result.scalars().all()
@@ -386,7 +389,8 @@ async def generate_dialogue_llm(db: AsyncSession, project_id: str, scene: Scene,
             ],
             temperature=0.8,
             max_tokens=8000,
-            response_format={"type": "json_object"}
+            response_format={"type": "json_object"},
+            usage_sink=resolve_usage_sink(usage_sink)
         )
         output = json.loads(response.content)
         output["generated_at"] = datetime.now(timezone.utc).isoformat()
@@ -397,7 +401,7 @@ async def generate_dialogue_llm(db: AsyncSession, project_id: str, scene: Scene,
         raise HTTPException(status_code=502, detail=f"Invalid JSON from AI: {e}")
 
 
-async def generate_action_llm(db: AsyncSession, project_id: str, scene: Scene, parameters: Dict[str, Any] = None) -> Dict[str, Any]:
+async def generate_action_llm(db: AsyncSession, project_id: str, scene: Scene, parameters: Dict[str, Any] = None, usage_sink: Optional[Callable[[AIResponse], Union[None, Awaitable[None]]]] = None) -> Dict[str, Any]:
     """Generate action/choreography using real LLM."""
     char_result = await db.execute(select(Character).where(Character.project_id == project_id))
     characters = char_result.scalars().all()
@@ -417,7 +421,8 @@ async def generate_action_llm(db: AsyncSession, project_id: str, scene: Scene, p
             ],
             temperature=0.7,
             max_tokens=8000,
-            response_format={"type": "json_object"}
+            response_format={"type": "json_object"},
+            usage_sink=resolve_usage_sink(usage_sink)
         )
         output = json.loads(response.content)
         output["generated_at"] = datetime.now(timezone.utc).isoformat()
@@ -428,7 +433,7 @@ async def generate_action_llm(db: AsyncSession, project_id: str, scene: Scene, p
         raise HTTPException(status_code=502, detail=f"Invalid JSON from AI: {e}")
 
 
-async def refine_scene_output_llm(db: AsyncSession, task: SceneEngineTask, feedback: str, refine_type: str) -> Dict[str, Any]:
+async def refine_scene_output_llm(db: AsyncSession, task: SceneEngineTask, feedback: str, refine_type: str, usage_sink: Optional[Callable[[AIResponse], Union[None, Awaitable[None]]]] = None) -> Dict[str, Any]:
     """Refine scene output using real LLM."""
     ai_client = await get_ai_client(db)
     prompt = build_scene_refine_prompt(task.output or {}, feedback, refine_type)
@@ -441,7 +446,8 @@ async def refine_scene_output_llm(db: AsyncSession, task: SceneEngineTask, feedb
             ],
             temperature=0.5,
             max_tokens=8000,
-            response_format={"type": "json_object"}
+            response_format={"type": "json_object"},
+            usage_sink=resolve_usage_sink(usage_sink)
         )
         output = json.loads(response.content)
         output["refined_at"] = datetime.now(timezone.utc).isoformat()
@@ -525,25 +531,26 @@ async def execute_scene_task(
     # Update status to processing
     task.status = SceneEngineTaskStatus.PROCESSING
     await db.commit()
-    
+    usage_sink = make_usage_sink(db, current_user.id, project_id=project_id)
+
     try:
         # Execute based on task type
         if task.task_type in (SceneEngineTaskType.BREAKDOWN_EPISODE, SceneEngineTaskType.GENERATE_SCENES):
-            output = await generate_episode_breakdown_llm(db, project_id, episode, task.input_parameters)
+            output = await generate_episode_breakdown_llm(db, project_id, episode, task.input_parameters, usage_sink=usage_sink)
         elif task.task_type == SceneEngineTaskType.GENERATE_SHOTS:
             if not scene:
                 raise ValueError("Scene ID required for shot generation")
-            output = await generate_scene_shots_llm(db, project_id, scene, task.input_parameters)
+            output = await generate_scene_shots_llm(db, project_id, scene, task.input_parameters, usage_sink=usage_sink)
         elif task.task_type == SceneEngineTaskType.GENERATE_DIALOGUE:
             if not scene:
                 raise ValueError("Scene ID required for dialogue generation")
-            output = await generate_dialogue_llm(db, project_id, scene, task.input_parameters)
+            output = await generate_dialogue_llm(db, project_id, scene, task.input_parameters, usage_sink=usage_sink)
         elif task.task_type == SceneEngineTaskType.GENERATE_ACTION:
             if not scene:
                 raise ValueError("Scene ID required for action generation")
-            output = await generate_action_llm(db, project_id, scene, task.input_parameters)
+            output = await generate_action_llm(db, project_id, scene, task.input_parameters, usage_sink=usage_sink)
         elif task.task_type == SceneEngineTaskType.REFINE_SCENES:
-            output = await refine_scene_output_llm(db, task, task.context or "", "general")
+            output = await refine_scene_output_llm(db, task, task.context or "", "general", usage_sink=usage_sink)
         else:
             raise ValueError(f"Unknown task type: {task.task_type}")
         
@@ -684,7 +691,8 @@ async def refine_scene_task(
     if task.status != SceneEngineTaskStatus.COMPLETED:
         raise HTTPException(status_code=400, detail="Can only refine completed tasks")
     
-    refined = await refine_scene_output_llm(db, task, refine_data.feedback, refine_data.refine_type)
+    refined = await refine_scene_output_llm(db, task, refine_data.feedback, refine_data.refine_type,
+        usage_sink=make_usage_sink(db, current_user.id, project_id=project_id))
     
     # Create new task for refinement
     new_task = SceneEngineTask(
